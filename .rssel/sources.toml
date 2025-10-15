@@ -1,0 +1,4 @@
+# rssel sources
+[groups]
+tech = ["https://this-week-in-rust.org/rss.xml"]
+news = ["https://www.theguardian.com/world/rss"]

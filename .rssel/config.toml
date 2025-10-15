@@ -1,0 +1,6 @@
+# rssel config (self-contained)
+# Paths are relative to the project folder by default
+data_dir = "./.rssel"
+sources_file = "./.rssel/sources.toml"
+editor = "nvim"
+# clipboard_cmd = "wl-copy"
