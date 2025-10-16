@@ -2,5 +2,42 @@
 # Paths are relative to the project folder by default
 data_dir = "./.rssel"
 sources_file = "./.rssel/sources.toml"
+stopwords_file = "./.rssel/stopwords.txt"
+
+# Sync auto-tagging defaults
+sync_auto_tags = "true"
+sync_max_tags = "5"
+sync_include_domain = "false"
+
+# Display defaults ("true"/"false")
+display_color = "true"
+display_show_url = "false"
+display_show_tags = "true"
+display_show_path = "false"
+display_show_date = "false"
+display_show_snippet = "false"
+display_snippet_len = "240"
+
+# Internal file-tree export (list/pick/pick-tags --export and sync)
+export_dir = "./.rssel/fs"
+export_format = "md"
+
+# External export defaults (export --to file)
+external_export_dir = "./export"
+external_export_format = "md"
+
+# list --new window (hours)
+new_hours = "24"
+
+# copy defaults
+# part: url|title|summary|content
+copy_default_part = "url"
+copy_default_plain = "false"
+# supports \n and \t escapes
+copy_separator = "\n"
+
+# Tools
+# Preferred editor (RSSEL_EDITOR env overrides)
 editor = "nvim"
-# clipboard_cmd = "wl-copy"
+# Clipboard command (auto-detects wl-copy/xclip/xsel/pbcopy if empty)
+clipboard_cmd = ""

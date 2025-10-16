@@ -1,0 +1,27 @@
+{
+  "sources": [
+    {
+      "title": "This Week in Rust",
+      "url": "https://this-week-in-rust.org/rss.xml",
+      "groups": [
+        "tech"
+      ]
+    },
+    {
+      "title": "The Guardian World",
+      "url": "https://www.theguardian.com/world/rss",
+      "groups": [
+        "news"
+      ]
+    },
+    {
+      "title": "Chris Skinner",
+      "url": "https://thefinanser.com/feed/",
+      "groups": [
+        "idea",
+        "finance"
+      ]
+    }
+  ]
+}
+
