@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import time
 import os
 import sys
 import sqlite3
@@ -7,6 +8,8 @@ import json
 import shutil
 import tempfile
 import subprocess
+import tarfile
+import io
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -88,7 +91,7 @@ def full_config_template() -> str:
         "# Display defaults (\"true\"/\"false\")\n"
         "display_color = \"false\"\n"
         "display_show_url = \"false\"\n"
-        "display_show_tags = \"true\"\n"
+        "display_show_tags = \"false\"\n"
         "display_show_path = \"false\"\n"
         "display_show_date = \"false\"\n"
         "display_show_snippet = \"false\"\n"
@@ -101,6 +104,8 @@ def full_config_template() -> str:
         "external_export_format = \"md\"\n\n"
         "# list --new window (hours)\n"
         "new_hours = \"24\"\n\n"
+        "# list default max items (used when --limit not set)\n"
+        "list_max = \"2000\"\n\n"
         "# copy defaults\n"
         "# part: url|title|summary|content\n"
         "copy_default_part = \"url\"\n"
@@ -111,7 +116,10 @@ def full_config_template() -> str:
         "# Preferred editor (RSSEL_EDITOR env overrides)\n"
         "editor = \"nvim\"\n"
         "# Clipboard command (auto-detects wl-copy/xclip/xsel/pbcopy if empty)\n"
-        "clipboard_cmd = \"\"\n"
+        "clipboard_cmd = \"\"\n\n"
+        "# Highlight\n"
+        "# Path to a newline-separated word/phrase list for highlighting\n"
+        "highlight_words_file = \"./.rssel/highlights.txt\"\n"
     )
 
 
@@ -167,14 +175,19 @@ def resolve_display_opts(args) -> dict:
         snippet_len = int(snip_str) if snip_str is not None else 240
     except ValueError:
         snippet_len = 240
+    # Color handling: enabled via --color or config; --nocolor disables
+    color_enabled = opt("color")
+    if getattr(args, "nocolor", False):
+        color_enabled = False
+    show_tags = False if getattr(args, "no_show_tags", False) else opt("show_tags")
     return {
         "show_url": opt("show_url"),
-        "show_tags": opt("show_tags"),
+        "show_tags": show_tags,
         "show_path": opt("show_path"),
         "show_date": opt("show_date"),
         "show_snippet": opt("show_snippet"),
         "show_source": opt("show_source"),
-        "color": opt("color"),
+        "color": color_enabled,
         "order": order,
         "snippet_len": snippet_len,
     }
@@ -202,6 +215,7 @@ def paths():
         "sources": os.path.join(home, "sources.json"),
         "db": os.path.join(home, "data.sqlite"),
         "stopwords": os.path.join(home, "stopwords.txt"),
+        "highlights": os.path.join(home, "highlights.txt"),
     }
 
 
@@ -243,9 +257,7 @@ def detect_clipboard_cmd(config: dict) -> list[str] | None:
     return None
 
 
-def parse_basic_toml_map_array(text: str) -> dict:
-    # Legacy support removed in favor of JSON sources; keep stub to avoid breakage
-    return {}
+# Note: legacy TOML sources support removed; JSON-only now.
 
 
 def parse_sources_file(text: str) -> list[dict]:
@@ -294,11 +306,13 @@ def read_config() -> dict:
         "data_dir": p["home"],
         "sources_file": p["sources"],
         "stopwords_file": p["stopwords"],
+        "highlight_words_file": p["highlights"],
         "export_dir": os.path.join(rssel_home(), "fs"),
         "export_format": "md",
         "external_export_dir": None,
         "external_export_format": "md",
         "new_hours": "24",
+        "list_max": "2000",
         "editor": None,
         "clipboard_cmd": None,
     }
@@ -401,6 +415,18 @@ def init_db(conn: sqlite3.Connection):
         except Exception:
             pass
     conn.commit()
+    # Helpful indexes for common queries
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_items_deleted ON items(deleted);
+        CREATE INDEX IF NOT EXISTS idx_items_starred ON items(starred);
+        CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_items_feed_deleted_read ON items(feed_url, deleted, read);
+        CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag_id);
+        CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_id);
+        CREATE INDEX IF NOT EXISTS idx_feeds_archived ON feeds(archived);
+        """
+    )
     conn.commit()
 
 
@@ -446,6 +472,13 @@ def cmd_init(args):
     else:
         print(f"Exists {p['stopwords']}")
 
+    # Create a default highlights file if missing
+    if not os.path.exists(p["highlights"]):
+        save_file(p["highlights"], default_highlights_content())
+        print(f"Created {p['highlights']}")
+    else:
+        print(f"Exists {p['highlights']}")
+
     conn = db_conn()
     init_db(conn)
     conn.close()
@@ -465,14 +498,50 @@ def cmd_sources(args):
         groups = e.get("groups") or ["ungrouped"]
         for g in groups:
             mapping.setdefault(g, []).append((title, url))
+    # Optionally enrich with DB info (archived flag and item counts)
+    db_cur = None
+    if getattr(args, "with_db", False):
+        conn = db_conn()
+        init_db(conn)
+        db_cur = conn.cursor()
     for grp in sorted(mapping.keys()):
         items = mapping[grp]
         print(f"[{grp}] ({len(items)})")
         for (title, url) in items:
+            arch = ""
+            count_str = ""
+            if db_cur is not None:
+                try:
+                    db_cur.execute("SELECT archived FROM feeds WHERE url = ?", (url,))
+                    row = db_cur.fetchone()
+                    if row and row[0]:
+                        arch = " [archived]"
+                    db_cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
+                    cnt = (db_cur.fetchone() or (0,))[0]
+                    count_str = f" (db items: {cnt})"
+                except Exception:
+                    pass
             if title:
-                print(f"  - {title} — {url}")
+                print(f"  - {title}{arch} — {url}{count_str}")
             else:
-                print(f"  - {url}")
+                print(f"  - {url}{arch}{count_str}")
+    # Optionally list DB-only sources (not present in config)
+    if db_cur is not None and getattr(args, "include_db_only", False):
+        try:
+            cfg_urls = {u for (_, ulist) in mapping.items() for (_, u) in ulist}
+            db_cur.execute("SELECT url, COALESCE(title, url) as name, archived FROM feeds ORDER BY name COLLATE NOCASE")
+            rows = db_cur.fetchall()
+            extras = [(name, url, archived) for (url, name, archived) in rows if url not in cfg_urls]
+            if extras:
+                print(f"[DB-only] ({len(extras)})")
+                for (name, url, archived) in extras:
+                    arch = " [archived]" if archived else ""
+                    # Count items
+                    db_cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
+                    cnt = (db_cur.fetchone() or (0,))[0]
+                    print(f"  - {name}{arch} — {url} (db items: {cnt})")
+        except Exception:
+            pass
     return 0
 
 
@@ -613,6 +682,12 @@ def cmd_fetch(args):
     feed_urls = [r[0] for r in cur.fetchall()]
     total_new = 0
     for url in feed_urls:
+        # Count existing items for this feed before insert
+        try:
+            cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ?", (url,))
+            before_count = (cur.fetchone() or (0,))[0]
+        except Exception:
+            before_count = None
         raw = http_get(url)
         if raw is None:
             continue
@@ -636,9 +711,18 @@ def cmd_fetch(args):
                 ),
             )
         conn.commit()
-        new_count = conn.total_changes
-        total_new += new_count
-        print(f"Fetched {url}: {len(items)} items, new {new_count}")
+        # Compute new inserts via table counts to avoid total_changes quirks
+        if before_count is not None:
+            try:
+                cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ?", (url,))
+                after_count = (cur.fetchone() or (0,))[0]
+                delta_new = max(0, after_count - before_count)
+            except Exception:
+                delta_new = 0
+        else:
+            delta_new = 0
+        total_new += delta_new
+        print(f"Fetched {url}: {len(items)} items, new {delta_new}")
     print(f"Done. Total new items inserted: {total_new}")
     return 0
 
@@ -692,17 +776,35 @@ def _print_meta_block(conn: sqlite3.Connection, item: dict, dt: str, opts: dict)
 
 
 def cmd_list(args):
+    t0 = time.perf_counter()
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
-    # If --source present with no value, list sources summary
-    if getattr(args, "source", None) == "__LIST__":
-        cur.execute("SELECT rowid, url, COALESCE(title, url) as name, archived FROM feeds ORDER BY name COLLATE NOCASE")
+    # Resolve display options early so sources summary can use color
+    opts = resolve_display_opts(args)
+    # If --sources or --list-sources, list sources summary
+    if getattr(args, "sources", False) or getattr(args, "list_sources", False):
+        # Sorting for the summary
+        order_by = "name COLLATE NOCASE"
+        if getattr(args, "sort_id_rev", False):
+            order_by = "rowid ASC"
+        elif getattr(args, "sort_id", False):
+            order_by = "rowid DESC"
+        elif getattr(args, "sort_group", False):
+            order_by = "feeds.grp COLLATE NOCASE, name COLLATE NOCASE"
+        elif getattr(args, "sort_name", False):
+            order_by = "name COLLATE NOCASE"
+        cur.execute(f"SELECT rowid, url, COALESCE(title, url) as name, archived FROM feeds ORDER BY {order_by}")
         feeds_rows = cur.fetchall()
+        # Build rows with counts, last date, top tags
+        data = []
         for (rid, url, name, archived) in feeds_rows:
-            # Count items
-            cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
-            count = (cur.fetchone() or (0,))[0]
+            # Count items and last published date
+            cur.execute("SELECT COUNT(*), MAX(published_ts) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
+            row = cur.fetchone() or (0, None)
+            count = row[0] or 0
+            last_ts = row[1]
+            last = datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M") if last_ts else "----"
             # Top tags
             cur.execute(
                 """
@@ -713,13 +815,40 @@ def cmd_list(args):
                 WHERE items.feed_url = ? AND items.deleted = 0
                 GROUP BY t.name
                 ORDER BY c DESC, t.name
-                LIMIT 10
+                LIMIT 5
                 """,
                 (url,),
             )
             tag_list = [r[0] for r in cur.fetchall()]
-            arch = " [archived]" if archived else ""
-            print(f"{rid:4d}  {name}{arch}  (items: {count})  tags: [" + ", ".join(tag_list) + "]")
+            data.append((rid, name, url, archived, count, last, tag_list))
+        # Pretty print as a simple table
+        id_w = 4
+        items_w = 6
+        state_w = 9  # 'ARCHIVED' or 'ACTIVE'
+        last_w = 16
+        name_w = 32
+        url_w = 42
+        def trunc(s, w):
+            s = str(s)
+            return s if len(s) <= w else (s[: w - 1] + "…")
+        header = f"{'ID':>{id_w}}  {'Items':>{items_w}}  {'Last':<{last_w}}  {'Name':<{name_w}}  {'URL':<{url_w}}  Tags"
+        print(_maybe(header, opts.get('color'), 2))
+        print("-" * len(header))
+        for (rid, name, url, archived, count, last, tags) in data:
+            id_s = _maybe(f"{rid:>{id_w}d}", opts.get('color'), 2)
+            items_s = _maybe(f"{count:>{items_w}d}", opts.get('color'), 2)
+            last_s = _maybe(f"{trunc(last, last_w):<{last_w}}", opts.get('color'), 2)
+            # Name with optional colored [archived] suffix, keeping column width
+            if archived:
+                suffix = _maybe(" [archived]", opts.get('color'), 31)
+                base_w = max(0, name_w - len(" [archived]"))
+                name_base = f"{trunc(name, base_w):<{base_w}}"
+                name_s = _maybe(name_base, opts.get('color'), 1) + suffix
+            else:
+                name_s = _maybe(f"{trunc(name, name_w):<{name_w}}", opts.get('color'), 1)
+            url_s = _maybe(f"{trunc(url, url_w):<{url_w}}", opts.get('color'), 36)
+            tags_s = ", ".join(_maybe(t, opts.get('color'), 33) for t in tags)
+            print(f"{id_s}  {items_s}  {last_s}  {name_s}  {url_s}  [" + tags_s + "]")
         return 0
     # Optional: list all tags with counts
     if getattr(args, "list_tags", False):
@@ -731,6 +860,15 @@ def cmd_list(args):
             where.append(f"EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp IN ({placeholders}))")
             params.extend(glist)
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        # Sorting and limiting for tags
+        tsort = getattr(args, "tags_sort", None) or "count-desc"
+        if tsort == "name":
+            order_sql = "ORDER BY t.name COLLATE NOCASE"
+        elif tsort == "count-asc":
+            order_sql = "ORDER BY cnt ASC, t.name COLLATE NOCASE"
+        else:
+            order_sql = "ORDER BY cnt DESC, t.name COLLATE NOCASE"
+        limit_sql = f"LIMIT {int(args.tags_top)}" if getattr(args, "tags_top", None) else ""
         sql = f"""
             SELECT t.name, COUNT(*) as cnt
             FROM tags t
@@ -739,7 +877,8 @@ def cmd_list(args):
             JOIN feeds ON feeds.url = items.feed_url
             {where_sql}
             GROUP BY t.name
-            ORDER BY cnt DESC, t.name
+            {order_sql}
+            {limit_sql}
         """
         cur.execute(sql, params)
         for (name, cnt) in cur.fetchall():
@@ -756,7 +895,7 @@ def cmd_list(args):
         params.extend(glist)
     # Filter by source (id or url)
     src = getattr(args, "source", None)
-    if src and src != "__LIST__":
+    if src:
         url_val = None
         try:
             rid = int(src)
@@ -827,17 +966,44 @@ def cmd_list(args):
     if getattr(args, "star_only", False):
         where.append("items.starred = 1")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    limit_sql = f"LIMIT {int(args.limit)}" if args.limit else ""
+    # Effective limit: CLI --limit or config list_max
+    eff_limit = None
+    try:
+        eff_limit = int(args.limit) if args.limit else int(read_config().get("list_max", "2000"))
+    except Exception:
+        eff_limit = None
+    limit_sql = f"LIMIT {eff_limit}" if eff_limit else ""
+    # Sorting
+    order_by = None
+    if getattr(args, "sort_id_rev", False):
+        order_by = "items.id ASC"
+    elif getattr(args, "sort_id", False):
+        order_by = "items.id DESC"
+    elif getattr(args, "sort_name", False):
+        order_by = "LOWER(COALESCE(items.title,'')) ASC, items.id ASC"
+    elif getattr(args, "sort_group", False):
+        order_by = f"feeds.grp COLLATE NOCASE ASC, {ts_field} DESC, items.id DESC"
+    elif getattr(args, "sort_count", False):
+        order_by = f"(SELECT COUNT(*) FROM item_tags it2 WHERE it2.item_id = items.id) DESC, {ts_field} DESC, items.id DESC"
+    elif getattr(args, "sort_date_old", False):
+        order_by = f"{ts_field} ASC, items.id ASC"
+    else:  # default or --sort-date-new
+        order_by = f"{ts_field} DESC, items.id DESC"
     sql = f"""
         SELECT items.id, items.published_ts, items.read, feeds.grp, items.title, items.feed_url
         FROM items JOIN feeds ON items.feed_url = feeds.url
         {where_sql}
-        ORDER BY items.published_ts DESC, items.id DESC
+        ORDER BY {order_by}
         {limit_sql}
     """
     cur.execute(sql, params)
     rows = cur.fetchall()
-    opts = resolve_display_opts(args)
+    # opts already computed above
+    # Optional highlight support
+    hl_terms: list[str] = []
+    do_highlight = getattr(args, "highlight", False) or getattr(args, "highlight_only", False)
+    if do_highlight:
+        hl_terms = load_highlight_words()
     # Optional export
     if getattr(args, "export", False) and rows:
         cfg = read_config()
@@ -845,10 +1011,158 @@ def cmd_list(args):
         fmt = args.format or cfg.get("export_format") or "md"
         n = export_rows(conn, rows, os.path.abspath(dest), fmt)
         print(f"Exported {n} items to {os.path.abspath(dest)} (format: {fmt})")
+    # If JSON output requested, build and print JSON array
+    if getattr(args, "json", False):
+        out = []
+        cur_groups = conn.cursor()
+        src_name_cache: dict[str, str] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows:
+            # Highlight filter (optional)
+            is_hl = False
+            if do_highlight and hl_terms:
+                item_for_hl = get_item(conn, iid)
+                title_hl = (item_for_hl.get("title") if item_for_hl else title) or ""
+                body_hl = html_to_text((item_for_hl.get("content") if item_for_hl else None) or (item_for_hl.get("summary") if item_for_hl else None) or "")
+                low = (title_hl + "\n" + body_hl).lower()
+                is_hl = False
+                for term in hl_terms:
+                    t = term.strip()
+                    if not t:
+                        continue
+                    if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
+                        if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
+                            is_hl = True
+                            break
+                    else:
+                        if t.lower() in low:
+                            is_hl = True
+                            break
+                if getattr(args, "highlight_only", False) and not is_hl:
+                    continue
+            # groups
+            try:
+                cur_groups.execute("SELECT grp FROM feed_groups WHERE url = ? ORDER BY grp", (feed_url,))
+                groups = [r[0] for r in cur_groups.fetchall()]
+            except Exception:
+                groups = []
+            if not groups:
+                groups = [grp] if grp else []
+            # source name
+            src_name = src_name_cache.get(feed_url)
+            if src_name is None:
+                try:
+                    c = conn.cursor()
+                    c.execute("SELECT COALESCE(title, url) FROM feeds WHERE url = ?", (feed_url,))
+                    row = c.fetchone()
+                    src_name = row[0] if row else (feed_url or "")
+                except Exception:
+                    src_name = feed_url or ""
+                src_name_cache[feed_url] = src_name
+            # item details
+            item = get_item(conn, iid) or {"id": iid, "title": title, "group": grp, "feed_url": feed_url}
+            link = item.get("link")
+            path = expected_item_path(item, fmt='md', dest=default_fs_dest())
+            tags = get_item_tag_names(conn, iid)
+            body_html = (item.get("content") or item.get("summary") or "")
+            snippet = html_to_text(body_html)
+            maxlen = int(opts.get("snippet_len", 240))
+            if len(snippet) > maxlen:
+                snippet = snippet[:maxlen].rstrip() + "…"
+            dt_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else None
+            # Decide which metadata to include based strictly on CLI show flags
+            want_url = bool(getattr(args, "show_url", False))
+            want_path = bool(getattr(args, "show_path", False))
+            want_tags = bool(getattr(args, "show_tags", False))
+            want_date = bool(getattr(args, "show_date", False))
+            want_snip = bool(getattr(args, "show_snippet", False))
+            want_src = bool(getattr(args, "show_source", False))
+
+            # Build object (base fields are always included)
+            obj = {
+                "id": iid,
+                "title": title or "",
+                "read": bool(read),
+                "published_ts": ts,
+                "primary_group": grp,
+                "groups": groups[:],
+                "feed_url": feed_url,
+                "highlight": bool(is_hl),
+            }
+            if want_date:
+                obj["date"] = dt_str
+            if want_src:
+                obj["source"] = src_name
+            if want_url:
+                obj["link"] = link
+            if want_path:
+                obj["path"] = path
+            if want_tags:
+                obj["tags"] = tags[:]
+            if want_snip:
+                obj["snippet"] = snippet
+
+            # JSON output intentionally does not inject ANSI color codes into fields;
+            # downstream JSON tooling should receive plain strings. Use non-JSON modes
+            # (e.g., grid/list with --color) for colored terminal output.
+            out.append(obj)
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
     # Pre-prepare a cursor for fetching groups per feed
     cur_groups = conn.cursor()
+    # Optional grid layout
+    grid = getattr(args, "grid", False)
+    def _ansi_strip(s: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", s)
+    def _pad(s: str, w: int, right: bool = True) -> str:
+        clean = _ansi_strip(s)
+        extra = max(0, w - len(clean))
+        return (s + " " * extra) if right else (" " * extra + s)
+    def _truncate(s: str, w: int) -> str:
+        if w <= 0:
+            return ""
+        clean = _ansi_strip(s)
+        if len(clean) <= w:
+            return _pad(s, w)
+        # truncate plain text and append ellipsis
+        return clean[: max(0, w - 1)] + "…"
+    # Prepare grid settings
+    if grid:
+        col_id = 6
+        col_marks = 2
+        col_groups = 20
+        # In grid mode, ignore generic --show-* flags by default to reduce clutter.
+        # Users can explicitly choose metadata rows with --grid-meta.
+        allowed_meta = {"date", "path", "url", "tags", "source", "snippet"}
+        raw_meta = getattr(args, "grid_meta", None) or ""
+        meta_rows = [s for s in re.split(r"[,\s]+", raw_meta) if s]
+        meta_rows = [m for m in meta_rows if m in allowed_meta]
+        source_cache: dict[str, str] = {}
+    shown_count = 0
     for (iid, ts, read, grp, title, feed_url) in rows:
+        # Evaluate highlight state if requested
+        is_hl = False
+        if do_highlight and hl_terms:
+            item_for_hl = get_item(conn, iid)
+            title_hl = (item_for_hl.get("title") if item_for_hl else title) or ""
+            body_hl = html_to_text((item_for_hl.get("content") if item_for_hl else None) or (item_for_hl.get("summary") if item_for_hl else None) or "")
+            low = (title_hl + "\n" + body_hl).lower()
+            for term in hl_terms:
+                t = term.strip()
+                if not t:
+                    continue
+                if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
+                    if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
+                        is_hl = True
+                        break
+                else:
+                    if t.lower() in low:
+                        is_hl = True
+                        break
+        if getattr(args, "highlight_only", False) and not is_hl:
+            continue
+
         mark = " " if read else "*"
+        hmark = "!" if is_hl else " "
         dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
         # Compute all groups for this feed (fallback to primary if none)
         groups = []
@@ -860,27 +1174,86 @@ def cmd_list(args):
         if not groups:
             groups = [grp] if grp else []
         grp_label = "[" + ",".join(groups) + "]"
-        if opts["show_url"] or opts["show_tags"] or opts["show_path"] or opts["show_snippet"] or opts["show_date"]:
-            id_s = _maybe(str(iid), opts["color"], 2)  # dim
-            mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
-            grp_s = _maybe(grp_label, opts["color"], 36)  # cyan
-            title_s = _maybe(title or '', opts["color"], 1)
-            print(f"{id_s} {mark_s} {grp_s} {title_s}")
+        # Build base strings
+        id_s = _maybe(str(iid), opts["color"], 2)
+        mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
+        hmark_s = _maybe(hmark, opts["color"] and hmark == "!", 31, 1) if hmark.strip() else hmark
+        marks = mark_s + hmark_s
+        grp_s = _maybe(grp_label, opts["color"], 36)
+        # Highlighted items: color title differently (magenta + bold)
+        if is_hl:
+            title_s = _maybe(title or '', opts["color"], 35, 1)
         else:
-            id_s = _maybe(f"{iid:6d}", opts["color"], 2)
-            mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
-            grp_s = _maybe(grp_label, opts["color"], 36)
-            dt_s = _maybe(dt, opts["color"], 2)
             title_s = _maybe(title or '', opts["color"], 1)
-            print(f"{id_s} {mark_s} {grp_s} {dt_s}  {title_s}")
-        if opts.get("show_url") or opts.get("show_tags") or opts.get("show_path") or opts.get("show_snippet") or opts.get("show_date") or opts.get("show_source") or getattr(args, "show_source", False):
-            # pass feed_url in fallback so source lookup works
-            item = get_item(conn, iid) or {"id": iid, "link": None, "group": grp, "title": title, "feed_url": feed_url}
-            # Merge show_source flag from args into opts for order handling
-            if getattr(args, "show_source", False):
-                opts = dict(opts)
-                opts["show_source"] = True
-            _print_meta_block(conn, item, dt, opts)
+        dt_s = _maybe(dt, opts["color"], 2)
+
+        if grid:
+            # Base row: id, marks, groups, title (no truncation; piping friendly)
+            print(_pad(id_s, col_id, right=False), _pad(marks, col_marks), _truncate(grp_s, col_groups), title_s)
+            # Extra rows: id + label + value
+            label_w = 10
+            item = None
+            for key in meta_rows:
+                label = key
+                if key == "date":
+                    val = _maybe(dt, opts["color"], 2)
+                elif key == "path":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    p = expected_item_path(item or {"id": iid, "title": title, "group": grp}, fmt='md', dest=default_fs_dest())
+                    val = _maybe(p, opts["color"], 32)
+                elif key == "url":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    val = (item or {}).get("link") or ""
+                elif key == "tags":
+                    tags = get_item_tag_names(conn, iid)
+                    val = _maybe(", ".join(tags), opts["color"], 33)
+                elif key == "source":
+                    name = source_cache.get(feed_url)
+                    if name is None:
+                        try:
+                            c2 = conn.cursor()
+                            c2.execute("SELECT COALESCE(title, url) FROM feeds WHERE url = ?", (feed_url,))
+                            row = c2.fetchone()
+                            name = row[0] if row else (feed_url or "")
+                        except Exception:
+                            name = feed_url or ""
+                        source_cache[feed_url] = name
+                    val = _maybe(name, opts["color"], 36)
+                elif key == "snippet":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    txt = html_to_text((item or {}).get("content") or (item or {}).get("summary") or "")
+                    maxlen = int(opts.get("snippet_len", 240))
+                    if len(txt) > maxlen:
+                        txt = txt[:maxlen].rstrip() + "…"
+                    val = _maybe(txt, opts["color"], 90, 90)
+                else:
+                    val = ""
+                lab_s = _maybe(f"{label}:", opts["color"], 2)
+                print(_pad(id_s, col_id, right=False), " ", _pad(lab_s, label_w), val)
+            shown_count += 1
+        else:
+            if opts["show_url"] or opts["show_tags"] or opts["show_path"] or opts["show_snippet"] or opts["show_date"]:
+                print(f"{id_s} {marks} {grp_s} {title_s}")
+            else:
+                id_p = _maybe(f"{iid:6d}", opts["color"], 2)
+                grp_p = _maybe(grp_label, opts["color"], 36)
+                print(f"{id_p} {marks} {grp_p} {dt_s}  {title_s}")
+            shown_count += 1
+            if opts.get("show_url") or opts.get("show_tags") or opts.get("show_path") or opts.get("show_snippet") or opts.get("show_date") or opts.get("show_source") or getattr(args, "show_source", False):
+                # pass feed_url in fallback so source lookup works
+                item = get_item(conn, iid) or {"id": iid, "link": None, "group": grp, "title": title, "feed_url": feed_url}
+                # Merge show_source flag from args into opts for order handling
+                if getattr(args, "show_source", False):
+                    opts = dict(opts)
+                    opts["show_source"] = True
+                _print_meta_block(conn, item, dt, opts)
+    # Summary line: number of items and elapsed time
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    print(f"Total: {shown_count} item(s)  in {elapsed:.2f}s")
     return 0
 
 
@@ -1142,11 +1515,44 @@ def load_stopwords() -> set[str]:
     return words
 
 
+def default_highlights_content() -> str:
+    return "\n".join([
+        "# Highlight words/phrases (one per line)",
+        "# Matching is case-insensitive and uses word boundaries where possible.",
+        "# Examples:",
+        "rust",
+        "release notes",
+        "sverige",
+        "översikt",
+        "källor",
+        "",
+    ])
+
+
+def load_highlight_words() -> list[str]:
+    cfg = read_config()
+    path = cfg.get("highlight_words_file")
+    words: list[str] = []
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    words.append(line)
+        except Exception:
+            pass
+    return words
+
+
 def _tokenize(text: str) -> list[str]:
     text = text.lower()
-    # keep letters, numbers, and hyphens inside words; split on others
-    words = re.split(r"[^a-z0-9\-]+", text)
-    return [w.strip("-") for w in words if w and not w.isdigit()]
+    # Unicode-aware: keep letters/numbers/underscore and hyphens; split on others
+    # \w matches Unicode word chars when using Python's re (default is UNICODE)
+    words = re.split(r"[^\w\-]+", text)
+    # Strip surrounding hyphens/underscores and drop pure-digit tokens
+    return [w.strip("-_") for w in words if w and not w.isdigit()]
 
 
 def extract_auto_tags(title: str | None, body_text: str | None, max_tags: int = 5, min_len: int = 3, stopwords: set[str] | None = None) -> list[str]:
@@ -1378,14 +1784,26 @@ def cmd_archive_source(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
+    # Resolve URL (supports --url or --id)
+    url = getattr(args, "url", None)
+    if not url and getattr(args, "id", None) is not None:
+        try:
+            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (int(args.id),))
+            row = cur.fetchone()
+            url = row[0] if row else None
+        except Exception:
+            url = None
+    if not url:
+        print("Provide --url or a valid --id", file=sys.stderr)
+        return 1
     if args.undo:
-        cur.execute("UPDATE feeds SET archived = 0 WHERE url = ?", (args.url,))
-        print(f"Unarchived source {args.url}")
+        cur.execute("UPDATE feeds SET archived = 0 WHERE url = ?", (url,))
+        print(f"Unarchived source {url}")
     else:
-        cur.execute("UPDATE feeds SET archived = 1 WHERE url = ?", (args.url,))
-        print(f"Archived source {args.url}")
+        cur.execute("UPDATE feeds SET archived = 1 WHERE url = ?", (url,))
+        print(f"Archived source {url}")
         if args.delete_items:
-            cur.execute("UPDATE items SET deleted = 1 WHERE feed_url = ? AND starred = 0", (args.url,))
+            cur.execute("UPDATE items SET deleted = 1 WHERE feed_url = ? AND starred = 0", (url,))
             print("  Marked existing items deleted")
     conn.commit()
     return 0
@@ -1411,6 +1829,106 @@ def cmd_archive_group(args):
             cur.executemany("UPDATE items SET deleted = 1 WHERE feed_url = ? AND starred = 0", [(u,) for u in urls])
             print("  Marked existing items deleted")
     conn.commit()
+    return 0
+
+
+# ---------------- Delete commands (soft delete separate from archive) ---------------- #
+
+def cmd_delete_id(args):
+    conn = db_conn()
+    init_db(conn)
+    cur = conn.cursor()
+    if getattr(args, "undo", False):
+        cur.execute("UPDATE items SET deleted = 0 WHERE id = ?", (args.id,))
+        conn.commit()
+        print(f"Undeleted item {args.id}")
+        return 0
+    if not getattr(args, "force", False):
+        # Protect starred by default
+        cur.execute("SELECT starred FROM items WHERE id = ?", (args.id,))
+        row = cur.fetchone()
+        if not row:
+            print(f"No item {args.id}")
+            return 1
+        if row[0]:
+            print("Refusing to delete a starred item (use --force)", file=sys.stderr)
+            return 1
+    cur.execute("UPDATE items SET deleted = 1 WHERE id = ?", (args.id,))
+    conn.commit()
+    print(f"Deleted item {args.id} (soft)")
+    return 0
+
+
+def cmd_delete_source(args):
+    conn = db_conn()
+    init_db(conn)
+    cur = conn.cursor()
+    # Resolve URL (supports --url or --id)
+    url = getattr(args, "url", None)
+    if not url and getattr(args, "id", None) is not None:
+        try:
+            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (int(args.id),))
+            row = cur.fetchone()
+            url = row[0] if row else None
+        except Exception:
+            url = None
+    if not url:
+        print("Provide --url or a valid --id", file=sys.stderr)
+        return 1
+    if getattr(args, "undo", False):
+        cur.execute("UPDATE items SET deleted = 0 WHERE feed_url = ?", (url,))
+        conn.commit()
+        print(f"Undeleted items for source {url}")
+        return 0
+    if getattr(args, "force", False):
+        cur.execute("UPDATE items SET deleted = 1 WHERE feed_url = ?", (url,))
+    else:
+        cur.execute("UPDATE items SET deleted = 1 WHERE feed_url = ? AND COALESCE(starred,0) = 0", (url,))
+    conn.commit()
+    print(f"Deleted items for source {url} (soft)")
+    return 0
+
+
+# ---------------- Source management ---------------- #
+
+def cmd_source_rm(args):
+    conn = db_conn()
+    init_db(conn)
+    cur = conn.cursor()
+    # Resolve URL from --url or --id
+    url = getattr(args, "url", None)
+    if not url and getattr(args, "id", None) is not None:
+        try:
+            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (int(args.id),))
+            row = cur.fetchone()
+            url = row[0] if row else None
+        except Exception:
+            url = None
+    if not url:
+        print("Provide --url or a valid --id", file=sys.stderr)
+        return 1
+    # Show a dry-run summary unless --yes
+    cur.execute("SELECT COALESCE(title, url), archived FROM feeds WHERE url = ?", (url,))
+    r = cur.fetchone()
+    if not r:
+        print("Source not found in DB (already removed?)")
+        return 0
+    name, archived = r
+    cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ?", (url,))
+    icount = (cur.fetchone() or (0,))[0]
+    if not getattr(args, "yes", False):
+        print(f"About to remove source: {name} — {url}")
+        print(f"This will delete the feed and {icount} item(s) (ON DELETE CASCADE). Use --yes to confirm.")
+        return 0
+    # Delete feed row; cascades to items and feed_groups
+    cur.execute("DELETE FROM feeds WHERE url = ?", (url,))
+    conn.commit()
+    if getattr(args, "vacuum", False):
+        try:
+            cur.execute("VACUUM")
+        except Exception:
+            pass
+    print(f"Removed source and cascaded items: {name} — {url}")
     return 0
 
 
@@ -1669,6 +2187,61 @@ def write_item_file(dest_dir: str, item: dict, fmt: str, tags: list[str] | None 
         f.write(text)
 
 
+def build_item_blob(item: dict, fmt: str, tags: list[str] | None = None) -> tuple[str, bytes]:
+    """Build a relative file path and bytes content for an item export.
+    Returns (relpath, data_bytes). relpath uses group directory and slug filename.
+    """
+    dt = datetime.fromtimestamp(item.get("published_ts") or 0).strftime("%Y-%m-%d %H:%M") if item.get("published_ts") else ""
+    title = item.get("title") or ""
+    link = item.get("link") or ""
+    summary = item.get("summary") or ""
+    content = item.get("content") or ""
+    grp = item.get("group") or "ungrouped"
+    tags = tags or []
+    if fmt == "json":
+        data = {
+            "id": item["id"],
+            "group": grp,
+            "title": title,
+            "link": link,
+            "published": dt,
+            "summary": summary,
+            "content": content,
+            "tags": tags,
+            "text": html_to_text(content or summary),
+        }
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        ext = ".json"
+    elif fmt == "html":
+        header_html = []
+        if title:
+            header_html.append(f"<h1>{title}</h1>")
+        meta_line = " ".join(filter(None, [f"[{grp}]" if grp else None, dt]))
+        if meta_line:
+            header_html.append(f"<p><em>{meta_line}</em></p>")
+        if link:
+            header_html.append(f"<p><a href=\"{link}\">{link}</a></p>")
+        if tags:
+            header_html.append("<p><strong>Tags:</strong> " + ", ".join(tags) + "</p>")
+        body_html = content or summary or ""
+        text = "\n".join(header_html) + "\n" + body_html + "\n"
+        ext = ".html"
+    else:
+        body_text = html_to_text(content or summary) if fmt in ("md", "txt") else (content or summary)
+        header = [
+            f"# {title}" if fmt == "md" else title,
+            f"[{grp}] {dt}",
+            link,
+            ("Tags: " + ", ".join(tags)) if tags else "",
+            "",
+        ]
+        text = "\n".join(header) + body_text + "\n"
+        ext = ".md" if fmt == "md" else ".txt"
+    fname = f"{item['id']:06d}-{slugify(title)}{ext}"
+    relpath = os.path.join(grp, fname)
+    return relpath, text.encode("utf-8")
+
+
 def export_rows(conn: sqlite3.Connection, rows, dest: str, fmt: str) -> int:
     os.makedirs(dest, exist_ok=True)
     groups_done: set[str] = set()
@@ -1853,6 +2426,180 @@ def cmd_sync(args):
     return 0
 
 
+def cmd_cold(args):
+    conn = db_conn()
+    init_db(conn)
+    cur = conn.cursor()
+    where = ["items.deleted = 0"]
+    params: list = []
+    # group filter
+    glist = _parse_groups_arg(getattr(args, "group", None))
+    if glist:
+        placeholders = ",".join(["?"] * len(glist))
+        where.append(f"items.feed_url IN (SELECT url FROM feed_groups WHERE grp IN ({placeholders}))")
+        params.extend(glist)
+    # source filter (id or url)
+    src = getattr(args, "source", None)
+    if src:
+        url_val = None
+        try:
+            rid = int(src)
+            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (rid,))
+            row = cur.fetchone()
+            if row:
+                url_val = row[0]
+        except Exception:
+            url_val = None
+        url_val = url_val or src
+        where.append("items.feed_url = ?")
+        params.append(url_val)
+    # tag intersection filter
+    if getattr(args, "tags", None):
+        tag_list = [t.strip().lower() for t in re.split(r"[,\s]+", args.tags) if t.strip()]
+        if tag_list:
+            placeholders = ",".join(["?"] * len(tag_list))
+            where.append(
+                f"items.id IN ("
+                f"  SELECT it.item_id FROM item_tags it JOIN tags t ON t.id = it.tag_id"
+                f"  WHERE t.name IN ({placeholders})"
+                f"  GROUP BY it.item_id HAVING COUNT(DISTINCT t.name) = {len(tag_list)}"
+                f")"
+            )
+            params.extend(tag_list)
+    # read/star filters
+    if getattr(args, "read_only", False) and not args.unread_only:
+        where.append("items.read = 1")
+    if getattr(args, "unread_only", False):
+        where.append("items.read = 0")
+    if getattr(args, "star_only", False):
+        where.append("items.starred = 1")
+    # new window
+    if getattr(args, "new", False):
+        cfg = read_config()
+        try:
+            hours = int(cfg.get("new_hours", "24"))
+        except Exception:
+            hours = 24
+        now_ts = int(datetime.now().timestamp())
+        cutoff = now_ts - hours * 3600
+        where.append("items.created_ts >= ?")
+        params.append(cutoff)
+    # date filters
+    ts_field = "items.published_ts" if getattr(args, "date_field", "published") == "published" else "items.created_ts"
+    if getattr(args, "on", None):
+        day_start = _parse_date_arg(args.on)
+        if day_start is not None:
+            day_end = day_start + 24*3600
+            where.append(f"{ts_field} >= ? AND {ts_field} < ?")
+            params.extend([day_start, day_end])
+    else:
+        if getattr(args, "since", None):
+            since_ts = _parse_date_arg(args.since)
+            if since_ts is not None:
+                where.append(f"{ts_field} >= ?")
+                params.append(since_ts)
+        if getattr(args, "until", None):
+            until_ts = _parse_date_arg(args.until)
+            if until_ts is not None:
+                where.append(f"{ts_field} < ?")
+                params.append(until_ts)
+    if getattr(args, "query", None):
+        where.append("(items.title LIKE ? OR items.summary LIKE ?)")
+        q = f"%{args.query}%"
+        params.extend([q, q])
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    # default ordering: newest first
+    limit_sql = f"LIMIT {int(args.limit)}" if getattr(args, "limit", None) else ""
+    sql = f"""
+        SELECT items.id, items.published_ts, items.read, feeds.grp, items.title, items.feed_url
+        FROM items JOIN feeds ON items.feed_url = feeds.url
+        {where_sql}
+        ORDER BY items.published_ts DESC, items.id DESC
+        {limit_sql}
+    """
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    # Optional highlight-only filter
+    hl_terms: list[str] = []
+    do_only_hl = getattr(args, "highlight_only", False)
+    if do_only_hl or getattr(args, "highlight", False):
+        hl_terms = load_highlight_words()
+    selected_rows = []
+    if do_only_hl and hl_terms:
+        for (iid, ts, read, grp, title, feed_url) in rows:
+            item = get_item(conn, iid)
+            title_hl = (item.get("title") if item else title) or ""
+            body_hl = html_to_text((item.get("content") if item else None) or (item.get("summary") if item else None) or "")
+            low = (title_hl + "\n" + body_hl).lower()
+            is_hl = False
+            for term in hl_terms:
+                t = term.strip()
+                if not t:
+                    continue
+                if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
+                    if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
+                        is_hl = True
+                        break
+                else:
+                    if t.lower() in low:
+                        is_hl = True
+                        break
+            if is_hl:
+                selected_rows.append((iid, ts, read, grp, title, feed_url))
+    else:
+        selected_rows = rows
+    # Prepare tar
+    out_path = args.output
+    gzip = not getattr(args, "no_gzip", False)
+    if not out_path:
+        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        out_path = os.path.join(rssel_home(), f"cold-{ts}.tar.gz")
+    # If gzip is desired but output doesn't end with .gz/.tgz, append .gz
+    if gzip and not out_path.endswith((".gz", ".tgz")):
+        out_path = out_path + ".gz"
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    mode = "w:gz" if gzip else "w"
+    count = 0
+    manifest_entries: list[dict] = []
+    with tarfile.open(out_path, mode) as tf:
+        for (iid, ts, read, grp, title, feed_url) in selected_rows:
+            item = get_item(conn, iid)
+            if not item:
+                continue
+            tags = get_item_tag_names(conn, iid)
+            relpath, data = build_item_blob(item, args.format, tags)
+            info = tarfile.TarInfo(name=relpath)
+            info.size = len(data)
+            info.mtime = int(item.get("published_ts") or datetime.now().timestamp())
+            tf.addfile(info, io.BytesIO(data))
+            count += 1
+            # Manifest entry
+            manifest_entries.append({
+                "id": int(item.get("id")),
+                "group": item.get("group"),
+                "title": item.get("title") or "",
+                "link": item.get("link") or "",
+                "published_ts": int(item.get("published_ts") or 0),
+                "date": datetime.fromtimestamp(item.get("published_ts") or 0).strftime("%Y-%m-%d %H:%M") if item.get("published_ts") else None,
+                "tags": tags,
+                "path": relpath,
+            })
+        # Add MANIFEST.json
+        manifest = {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "count": count,
+            "format": args.format,
+            "entries": manifest_entries,
+        }
+        mdata = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        minfo = tarfile.TarInfo(name="MANIFEST.json")
+        minfo.size = len(mdata)
+        minfo.mtime = int(datetime.now().timestamp())
+        tf.addfile(minfo, io.BytesIO(mdata))
+    print(f"Cold stored {count} item(s) to {os.path.abspath(out_path)} (format: {args.format})")
+    return 0
+
+
 # ---------------- Tagging commands ---------------- #
 
 def cmd_tags_auto(args):
@@ -1913,6 +2660,15 @@ def cmd_tags_list(args):
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    # Sorting + limit
+    tsort = getattr(args, "sort", None) or "count-desc"
+    if tsort == "name":
+        order_sql = "ORDER BY t.name COLLATE NOCASE"
+    elif tsort == "count-asc":
+        order_sql = "ORDER BY cnt ASC, t.name COLLATE NOCASE"
+    else:
+        order_sql = "ORDER BY cnt DESC, t.name COLLATE NOCASE"
+    limit_sql = f"LIMIT {int(args.top)}" if getattr(args, "top", None) else ""
     sql = f"""
         SELECT t.name, COUNT(*) as cnt
         FROM tags t
@@ -1921,7 +2677,8 @@ def cmd_tags_list(args):
         JOIN feeds ON feeds.url = items.feed_url
         {where_sql}
         GROUP BY t.name
-        ORDER BY cnt DESC, t.name
+        {order_sql}
+        {limit_sql}
     """
     cur.execute(sql, params)
     rows = cur.fetchall()
@@ -1930,11 +2687,7 @@ def cmd_tags_list(args):
     return 0
 
 
-def _print_item_rows(rows):
-    for (iid, ts, read, grp, title) in rows:
-        mark = " " if read else "*"
-        dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
-        print(f"{iid:6d} {mark} [{grp}] {dt}  {title or ''}")
+    
 
 
 def cmd_tags_items(args):
@@ -2025,6 +2778,19 @@ def cmd_tags_map(args):
         params.append(args.group)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     top_limit = f"LIMIT {int(args.top)}" if args.top else ""
+    having_sql = ""
+    params_tags = list(params)
+    if getattr(args, "min_count", None):
+        having_sql = "HAVING COUNT(*) >= ?"
+        params_tags.append(int(args.min_count))
+    # Sort order for tags
+    tsort = getattr(args, "sort", None) or "count-desc"
+    if tsort == "name":
+        order_tags_sql = "ORDER BY t.name COLLATE NOCASE"
+    elif tsort == "count-asc":
+        order_tags_sql = "ORDER BY cnt ASC, t.name COLLATE NOCASE"
+    else:
+        order_tags_sql = "ORDER BY cnt DESC, t.name COLLATE NOCASE"
     sql_tags = f"""
         SELECT t.id, t.name, COUNT(*) as cnt
         FROM tags t
@@ -2033,10 +2799,11 @@ def cmd_tags_map(args):
         JOIN feeds ON feeds.url = items.feed_url
         {where_sql}
         GROUP BY t.id, t.name
-        ORDER BY cnt DESC, t.name
+        {having_sql}
+        {order_tags_sql}
         {top_limit}
     """
-    cur.execute(sql_tags, params)
+    cur.execute(sql_tags, params_tags)
     tags = cur.fetchall()
     for (tid, name, cnt) in tags:
         # Fetch items for this tag
@@ -2055,13 +2822,144 @@ def cmd_tags_map(args):
         if getattr(args, "compact", False) or not getattr(args, "detailed", False):
             ids = [r[0] for r in rows]
             # Python-list style on one line
-            print(f"{name} ({cnt}): [" + ", ".join(str(i) for i in ids) + "]")
+            tname = _maybe(name, True, 36) if getattr(args, "color", False) else name
+            print(f"{tname} ({cnt}): [" + ", ".join(str(i) for i in ids) + "]")
         else:
-            print(f"[{name}] ({cnt})")
+            hname = _maybe(name, True, 36) if getattr(args, "color", False) else name
+            print(f"[{hname}] ({cnt})")
             for (iid, ts, read, grp, title) in rows:
                 mark = " " if read else "*"
                 dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
-                print(f"  {iid:6d} {mark} [{grp}] {dt}  {title or ''}")
+                if getattr(args, "color", False):
+                    id_s = _maybe(f"{iid:6d}", True, 2)
+                    grp_s = f"[{_maybe(grp, True, 36)}]"
+                    dt_s = _maybe(dt, True, 2)
+                    title_s = _maybe(title or '', True, 1)
+                    print(f"  {id_s} {mark} {grp_s} {dt_s}  {title_s}")
+                else:
+                    print(f"  {iid:6d} {mark} [{grp}] {dt}  {title or ''}")
+    return 0
+
+
+def _build_source_filter(cur: sqlite3.Cursor, src: str | None, src_id: int | None = None) -> tuple[str, list]:
+    """Build a SQL filter and params for restricting by source.
+    Accepts either a URL/string (which may be a numeric string id) or an explicit numeric id.
+    Returns (sql, params) like ("items.feed_url = ?", [url]).
+    """
+    # Explicit id takes precedence
+    if src_id is not None:
+        try:
+            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (int(src_id),))
+            row = cur.fetchone()
+            if row and row[0]:
+                return "items.feed_url = ?", [row[0]]
+        except Exception:
+            return "", []
+        return "", []
+    if not src:
+        return "", []
+    try:
+        rid = int(src)
+        cur.execute("SELECT url FROM feeds WHERE rowid = ?", (rid,))
+        row = cur.fetchone()
+        if row:
+            return "items.feed_url = ?", [row[0]]
+    except Exception:
+        pass
+    return "items.feed_url = ?", [src]
+
+
+def cmd_purge(args):
+    conn = db_conn()
+    init_db(conn)
+    cur = conn.cursor()
+
+    removed_deleted = 0
+    removed_older = 0
+    removed_tags = 0
+
+    def _apply_group(where: list[str], params: list):
+        glist = _parse_groups_arg(getattr(args, "group", None))
+        if glist:
+            placeholders = ",".join(["?"] * len(glist))
+            where.append(f"items.feed_url IN (SELECT url FROM feed_groups WHERE grp IN ({placeholders}))")
+            params.extend(glist)
+
+    # Purge items marked as deleted
+    if getattr(args, "deleted", False):
+        where = ["items.deleted = 1"]
+        params: list = []
+        _apply_group(where, params)
+        src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
+        if src_sql:
+            where.append(src_sql)
+            params.extend(src_params)
+        where_sql = " AND ".join(where)
+        cur.execute(f"SELECT COUNT(*) FROM items WHERE {where_sql}", params)
+        cnt = (cur.fetchone() or (0,))[0]
+        if not getattr(args, "dry_run", False):
+            cur.execute(f"DELETE FROM items WHERE {where_sql}", params)
+            conn.commit()
+        removed_deleted = cnt
+
+    # Purge read items older than cutoff (non-starred only)
+    cutoff_ts = None
+    if getattr(args, "older_days", None):
+        try:
+            cutoff_ts = int(datetime.now().timestamp()) - int(args.older_days) * 86400
+        except Exception:
+            cutoff_ts = None
+    if getattr(args, "before", None):
+        ts = _parse_date_arg(args.before)
+        if ts is not None:
+            cutoff_ts = ts if cutoff_ts is None else min(cutoff_ts, ts)
+    if cutoff_ts is not None:
+        where = ["items.read = 1", "COALESCE(items.starred, 0) = 0", "COALESCE(items.deleted, 0) = 0", "items.published_ts < ?"]
+        params: list = [cutoff_ts]
+        _apply_group(where, params)
+        src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
+        if src_sql:
+            where.append(src_sql)
+            params.extend(src_params)
+        where_sql = " AND ".join(where)
+        cur.execute(f"SELECT COUNT(*) FROM items WHERE {where_sql}", params)
+        cnt = (cur.fetchone() or (0,))[0]
+        if not getattr(args, "dry_run", False):
+            cur.execute(f"DELETE FROM items WHERE {where_sql}", params)
+            conn.commit()
+        removed_older = cnt
+
+    # Clean up unused tags
+    if getattr(args, "clean_tags", False):
+        cur.execute("SELECT COUNT(*) FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM item_tags)")
+        tcnt = (cur.fetchone() or (0,))[0]
+        if not getattr(args, "dry_run", False):
+            cur.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM item_tags)")
+            conn.commit()
+        removed_tags = tcnt
+
+    # Optional VACUUM
+    if getattr(args, "vacuum", False) and not getattr(args, "dry_run", False):
+        try:
+            cur.execute("VACUUM")
+        except Exception:
+            pass
+
+    # Summary
+    parts = []
+    if getattr(args, "deleted", False):
+        parts.append(f"purged_deleted={removed_deleted}")
+    if cutoff_ts is not None:
+        parts.append(f"purged_older={removed_older}")
+    if getattr(args, "clean_tags", False):
+        parts.append(f"removed_tags={removed_tags}")
+    if getattr(args, "vacuum", False):
+        parts.append("vacuumed")
+    if not parts:
+        print("Nothing to do. Use --deleted and/or --before/--older-days, optionally --clean-tags/--vacuum.")
+    else:
+        prefix = "[dry-run] " if getattr(args, "dry_run", False) else ""
+        print(prefix + ", ".join(parts))
     return 0
 
 
@@ -2075,7 +2973,20 @@ def cmd_tags_compact(args):
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    # Sorting, limit, and min-count for compact
     top_limit = f"LIMIT {int(args.top)}" if args.top else ""
+    tsort = getattr(args, "sort", None) or "count-desc"
+    if tsort == "name":
+        order_tags_sql = "ORDER BY t.name COLLATE NOCASE"
+    elif tsort == "count-asc":
+        order_tags_sql = "ORDER BY cnt ASC, t.name COLLATE NOCASE"
+    else:
+        order_tags_sql = "ORDER BY cnt DESC, t.name COLLATE NOCASE"
+    having_sql = ""
+    params_tags = list(params)
+    if getattr(args, "min_count", None):
+        having_sql = "HAVING COUNT(*) >= ?"
+        params_tags.append(int(args.min_count))
     sql_tags = f"""
         SELECT t.id, t.name, COUNT(*) as cnt
         FROM tags t
@@ -2084,10 +2995,11 @@ def cmd_tags_compact(args):
         JOIN feeds ON feeds.url = items.feed_url
         {where_sql}
         GROUP BY t.id, t.name
-        ORDER BY cnt DESC, t.name
+        {having_sql}
+        {order_tags_sql}
         {top_limit}
     """
-    cur.execute(sql_tags, params)
+    cur.execute(sql_tags, params_tags)
     tags = cur.fetchall()
     chunks: list[str] = []
     for (tid, name, cnt) in tags:
@@ -2295,62 +3207,13 @@ def detect_fzf() -> list[str] | None:
     return None
 
 
-def query_items(conn: sqlite3.Connection, group: str | None, unread_only: bool, limit: int | None, query: str | None):
-    cur = conn.cursor()
-    where = []
-    params: list = []
-    where.append("items.deleted = 0")
-    if group:
-        glist = _parse_groups_arg(group)
-        if glist:
-            placeholders = ",".join(["?"] * len(glist))
-            where.append(f"EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp IN ({placeholders}))")
-            params.extend(glist)
-    if unread_only:
-        where.append("items.read = 0")
-    if query:
-        where.append("(items.title LIKE ? OR items.summary LIKE ?)")
-        like = f"%{query}%"
-        params.extend([like, like])
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    limit_sql = f"LIMIT {int(limit)}" if limit else ""
-    sql = f"""
-        SELECT items.id, items.published_ts, items.read, feeds.grp, items.title, items.starred
-        FROM items JOIN feeds ON items.feed_url = feeds.url
-        {where_sql}
-        ORDER BY items.published_ts DESC, items.id DESC
-        {limit_sql}
-    """
-    cur.execute(sql, params)
-    return cur.fetchall()
+    
 
 
-def make_pick_lines(rows):
-    # Tab-separated to simplify parsing. id is the first column.
-    out = []
-    for (iid, ts, read, grp, title, *rest) in rows:
-        # If starred column is included by caller, rest[0] may be starred
-        starred = None
-        if rest:
-            starred = rest[0]
-        mark = (" " if read else "*") + ("★" if starred else " ")
-        dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
-        out.append(f"{iid}\t{mark}\t[{grp}]\t{dt}\t{title or ''}")
-    return "\n".join(out)
+    
 
 
-def pick_with_fzf(lines: str, initial_query: str | None):
-    cmd = detect_fzf()
-    if not cmd:
-        return None
-    fzf_cmd = cmd + ["--with-nth=1..", "--prompt", "rssel> "]
-    if initial_query:
-        fzf_cmd += ["--query", initial_query]
-    proc = subprocess.Popen(fzf_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    out, _ = proc.communicate(input=lines.encode("utf-8", errors="replace"))
-    if proc.returncode != 0:
-        return None
-    return out.decode("utf-8", errors="replace").strip()
+    
 
 
 def basic_picker(lines: str):
@@ -2455,12 +3318,32 @@ def cmd_pick(args):
             like = f"%{q}%"
             params.extend([like, like])
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        limit_sql = f"LIMIT {int(args.limit)}" if args.limit else ""
+        # Effective limit: CLI --limit or config list_max
+        try:
+            eff_limit = int(args.limit) if args.limit else int(read_config().get("list_max", "2000"))
+        except Exception:
+            eff_limit = None
+        limit_sql = f"LIMIT {eff_limit}" if eff_limit else ""
+        ts_field = "items.published_ts" if getattr(args, "date_field", "published") == "published" else "items.created_ts"
+        if getattr(args, "sort_id_rev", False):
+            order_by = "items.id ASC"
+        elif getattr(args, "sort_id", False):
+            order_by = "items.id DESC"
+        elif getattr(args, "sort_name", False):
+            order_by = "LOWER(COALESCE(items.title,'')) ASC, items.id ASC"
+        elif getattr(args, "sort_group", False):
+            order_by = f"feeds.grp COLLATE NOCASE ASC, {ts_field} DESC, items.id DESC"
+        elif getattr(args, "sort_date_old", False):
+            order_by = f"{ts_field} ASC, items.id ASC"
+        elif getattr(args, "sort_count", False):
+            order_by = f"(SELECT COUNT(*) FROM item_tags it2 WHERE it2.item_id = items.id) DESC, {ts_field} DESC, items.id DESC"
+        else:
+            order_by = f"{ts_field} DESC, items.id DESC"
         sql = f"""
             SELECT items.id, items.published_ts, items.read, feeds.grp, items.title, items.summary
             FROM items JOIN feeds ON items.feed_url = feeds.url
             {where_sql}
-            ORDER BY items.published_ts DESC, items.id DESC
+            ORDER BY {order_by}
             {limit_sql}
         """
         cur.execute(sql, params)
@@ -2534,100 +3417,7 @@ def cmd_pick(args):
     return 0
 
 
-def perform_pick_action(conn: sqlite3.Connection, iid: int, args):
-    if args.action == "print-id":
-        print(iid)
-        return 0
-    elif args.action == "view":
-        text = format_item_for_reading(get_item(conn, iid), mode="plain")
-        run_pager(text)
-        if getattr(args, "mark_read", False):
-            cur = conn.cursor()
-            cur.execute("UPDATE items SET read = 1 WHERE id = ?", (iid,))
-            conn.commit()
-        return 0
-    elif args.action == "open":
-        return cmd_open(argparse.Namespace(id=iid, mark_read=getattr(args, "mark_read", False)))
-    elif args.action == "export-editor":
-        item = get_item(conn, iid)
-        if not item:
-            return 1
-        text = item.get(args.part) or item.get("content") or item.get("summary") or item.get("link") or ""
-        if args.part in ("content", "summary"):
-            text = html_to_text(text)
-        return export_to_editor(text, read_config())
-    elif args.action == "export-clipboard":
-        item = get_item(conn, iid)
-        if not item:
-            return 1
-        text = item.get(args.part) or item.get("content") or item.get("summary") or item.get("link") or ""
-        if args.part in ("content", "summary"):
-            text = html_to_text(text)
-        return export_to_clipboard(text, read_config())
-    elif args.action == "pipe":
-        item = get_item(conn, iid)
-        if not item:
-            return 1
-        default = read_config().get("pipe_cmd") or "nvim -R -"
-        # non-interactive: just use default here
-        text = item.get(args.part) or item.get("content") or item.get("summary") or item.get("link") or ""
-        return pipe_to_command(text, default)
-    elif args.action == "mark-read":
-        cur = conn.cursor()
-        cur.execute("UPDATE items SET read = 1 WHERE id = ?", (iid,))
-        conn.commit()
-        print(f"Marked {iid} as read")
-        return 0
-    elif args.action == "mark-unread":
-        cur = conn.cursor()
-        cur.execute("UPDATE items SET read = 0 WHERE id = ?", (iid,))
-        conn.commit()
-        print(f"Marked {iid} as unread")
-        return 0
-    elif args.action == "toggle-star":
-        cur = conn.cursor()
-        cur.execute("UPDATE items SET starred = 1 - COALESCE(starred, 0) WHERE id = ?", (iid,))
-        conn.commit()
-        return 0
-    elif args.action == "trash":
-        cur = conn.cursor()
-        cur.execute("UPDATE items SET deleted = 1 WHERE id = ?", (iid,))
-        conn.commit()
-        print(f"Trashed {iid}")
-        return 0
-    elif args.action == "delete":
-        # Permanent delete
-        cur = conn.cursor()
-        cur.execute("DELETE FROM items WHERE id = ?", (iid,))
-        conn.commit()
-        print(f"Deleted {iid}")
-        return 0
-    elif args.action == "reload":
-        # Re-fetch current group (if any) and return
-        cmd_fetch(argparse.Namespace(group=getattr(args, "group", None)))
-        return 0
-    elif args.action == "cycle-group":
-        # Move the item's feed to the next group from sources
-        item = get_item(conn, iid)
-        if not item:
-            return 1
-        src = read_sources()
-        all_groups = sorted(src.keys())
-        if not all_groups:
-            return 0
-        cur_grp = item.get("group")
-        try:
-            idx = all_groups.index(cur_grp)
-        except ValueError:
-            idx = -1
-        next_grp = all_groups[(idx + 1) % len(all_groups)]
-        cur = conn.cursor()
-        cur.execute("UPDATE feeds SET grp = ? WHERE url = ?", (next_grp, item.get("feed_url")))
-        conn.commit()
-        print(f"Moved feed to group: {next_grp}")
-        return 0
-    else:
-        return 1
+    
 
 
 def build_parser():
@@ -2638,6 +3428,8 @@ def build_parser():
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("sources", help="Show configured groups and feeds")
+    sp.add_argument("--with-db", action="store_true", help="Show DB status: archived flag and current item counts")
+    sp.add_argument("--include-db-only", action="store_true", help="When used with --with-db, also list DB-only sources not present in config")
     sp.set_defaults(func=cmd_sources)
 
     sp = sub.add_parser("fetch", help="Fetch feeds and cache items")
@@ -2657,8 +3449,26 @@ def build_parser():
     sp.add_argument("--until", help="Filter by date/time < (exclusive)")
     sp.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
-    sp.add_argument("--source", nargs="?", const="__LIST__", help="Filter by a source (url or numeric id). If used with no value, lists sources summary")
+    sp.add_argument("--source", help="Filter by a source (url or numeric id)")
+    sp.add_argument("--sources", action="store_true", help="List sources summary (ids, names, urls, counts)")
+    sp.add_argument("--list-sources", action="store_true", help="Alias: list sources summary (ids, names, urls, counts)")
     sp.add_argument("--list-tags", action="store_true", help="List all tags with counts (optional: filter by --group)")
+    sp.add_argument("--tags-sort", choices=["name","count-asc","count-desc"], help="Sort order for --list-tags output (default: count-desc)")
+    sp.add_argument("--tags-top", type=int, help="Limit number of tags shown for --list-tags")
+    # Sorting options (mutually exclusive; last one wins if multiple)
+    sp.add_argument("--sort-id", action="store_true", help="Sort by item id (newest first)")
+    sp.add_argument("--sort-id-rev", action="store_true", help="Sort by item id (oldest first)")
+    sp.add_argument("--sort-name", action="store_true", help="Sort by title (A→Z)")
+    sp.add_argument("--sort-date-new", action="store_true", help="Sort by date (newest first)")
+    sp.add_argument("--sort-date-old", action="store_true", help="Sort by date (oldest first)")
+    sp.add_argument("--sort-group", action="store_true", help="Sort by group name (A→Z), then date newest")
+    sp.add_argument("--sort-count", action="store_true", help="Sort by tag count (desc), then date newest")
+    sp.add_argument("--highlight", action="store_true", help="Mark items matching highlight word list with '!' (see highlight_words_file in config)")
+    sp.add_argument("--highlight-only", action="store_true", help="Only show items that match the highlight word list")
+    sp.add_argument("--grid", action="store_true", help="Align output as a grid (columns)")
+    sp.add_argument("--grid-meta", help="In --grid mode, show selected metadata rows (comma/space list of: date,path,url,tags,source,snippet)")
+    sp.add_argument("--json", action="store_true", help="Output items as a JSON array (includes base fields + url/path/tags/source/snippet)")
+    sp.add_argument("--no-show-tags", dest="no_show_tags", action="store_true", help="Force-hide tags even if enabled in config")
     sp.add_argument("--show-url", action="store_true", help="Show URL as an indented metadata line")
     sp.add_argument("--show-tags", action="store_true", help="Show tags as an indented metadata line")
     sp.add_argument("--show-path", action="store_true", help="Show expected file path as an indented metadata line")
@@ -2667,6 +3477,7 @@ def build_parser():
     sp.add_argument("--show-source", action="store_true", help="Show the source (title or URL) as an indented metadata line")
     sp.add_argument("--color", action="store_true", help="Colorize output (titles, groups, markers)")
     sp.add_argument("--export", action="store_true", help="Export the filtered items to files")
+    sp.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output (overrides --color and config)")
     sp.add_argument("--dest", help="Export destination directory (defaults to export_dir in config)")
     sp.add_argument("--format", choices=["md", "txt", "json", "html"], help="Export format (defaults to export_format in config)")
     sp.set_defaults(func=cmd_list)
@@ -2704,10 +3515,26 @@ def build_parser():
     sp_read.add_argument("--no-mark-read", action="store_true", help="Do not mark item as read after viewing")
     sp_read.set_defaults(func=cmd_view)
 
+    # 'v' is a short alias of 'view'
+    sp_v = sub.add_parser("v", help="Alias for 'view'")
+    sp_v.add_argument("id", type=int, nargs="?", help="Item ID")
+    sp_v.add_argument("--next", action="store_true", help="Open next unread item")
+    sp_v.add_argument("--group", "-g", help="Restrict --next to a group")
+    sp_v.add_argument("--raw", action="store_true", help="Show raw HTML instead of plain text")
+    sp_v.add_argument("--mark-read", action="store_true", help="(Legacy) Mark item as read after viewing (default behavior)")
+    sp_v.add_argument("--no-mark-read", action="store_true", help="Do not mark item as read after viewing")
+    sp_v.set_defaults(func=cmd_view)
+
     sp = sub.add_parser("open", help="Open item link(s) in system browser")
     sp.add_argument("ids", type=int, nargs="+", help="Item ID(s)")
     sp.add_argument("--mark-read", action="store_true", help="Mark item(s) as read after opening")
     sp.set_defaults(func=cmd_open)
+
+    # 'o' is a short alias of 'open'
+    sp_o = sub.add_parser("o", help="Alias for 'open'")
+    sp_o.add_argument("ids", type=int, nargs="+", help="Item ID(s)")
+    sp_o.add_argument("--mark-read", action="store_true", help="Mark item(s) as read after opening")
+    sp_o.set_defaults(func=cmd_open)
 
     sp = sub.add_parser("edit", help="Open item content in your editor")
     sp.add_argument("id", type=int, help="Item ID")
@@ -2748,6 +3575,29 @@ def build_parser():
     sp_all.set_defaults(auto_tags=True)
     sp_all.set_defaults(func=cmd_sync)
 
+    # cold: archive filtered items into a tar(.gz) file
+    sp_cold = sub.add_parser("cold", help="Cold storage: save filtered items into a tar or tar.gz")
+    sp_cold.add_argument("--output", "-o", help="Output tar path ('.tar' or '.tar.gz'). Defaults to ./.rssel/cold-YYYYMMDDHHMMSS.tar.gz")
+    sp_cold.add_argument("--no-gzip", action="store_true", help="Write plain .tar instead of .tar.gz (gzip is default)")
+    sp_cold.add_argument("--format", choices=["md", "txt", "json", "html"], default="md", help="Export file format inside tar (default: md)")
+    # Filters mirroring list
+    sp_cold.add_argument("--group", "-g", help="Filter by group")
+    sp_cold.add_argument("--tags", help="Comma/space separated tag names; item must have ALL")
+    sp_cold.add_argument("--limit", "-n", type=int, help="Limit number of items")
+    sp_cold.add_argument("--unread-only", action="store_true", help="Only show unread items")
+    sp_cold.add_argument("--read", dest="read_only", action="store_true", help="Only show read items")
+    sp_cold.add_argument("--star", dest="star_only", action="store_true", help="Only show starred (favorite) items")
+    sp_cold.add_argument("--new", action="store_true", help="Only items added in the last 24 hours (config new_hours)")
+    sp_cold.add_argument("--query", "-q", help="Search in title/summary")
+    sp_cold.add_argument("--since", help="Filter by date/time >= (e.g., 2025-10-16 or 2025-10-16 12:00 or 'today')")
+    sp_cold.add_argument("--until", help="Filter by date/time < (exclusive)")
+    sp_cold.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
+    sp_cold.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
+    sp_cold.add_argument("--source", help="Filter by a source (url or numeric id)")
+    sp_cold.add_argument("--highlight", action="store_true", help="Enable highlight evaluation (paired with --highlight-only)")
+    sp_cold.add_argument("--highlight-only", action="store_true", help="Only include items that match the highlight word list")
+    sp_cold.set_defaults(func=cmd_cold)
+
     # pick: fuzzy filter; outputs like list using show flags
     sp_pick = sub.add_parser("pick", help="Fuzzy-pick items (filters) and print them like list")
     sp_pick.add_argument("--group", "-g", help="Filter by group")
@@ -2762,6 +3612,14 @@ def build_parser():
     sp_pick.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp_pick.add_argument("--date-field", choices=["published", "created"], default="published")
     sp_pick.add_argument("--query", "-q", help="Initial search query for fzf and DB filter")
+    # Sorting options similar to list
+    sp_pick.add_argument("--sort-id", action="store_true")
+    sp_pick.add_argument("--sort-id-rev", action="store_true")
+    sp_pick.add_argument("--sort-name", action="store_true")
+    sp_pick.add_argument("--sort-date-new", action="store_true")
+    sp_pick.add_argument("--sort-date-old", action="store_true")
+    sp_pick.add_argument("--sort-group", action="store_true")
+    sp_pick.add_argument("--sort-count", action="store_true")
     sp_pick.add_argument("--no-fzf", action="store_true", help="Print directly without fzf; same as list")
     sp_pick.add_argument("--multi", action="store_true", help="Allow selecting multiple items in fzf")
     # Show options (same as list)
@@ -2823,6 +3681,8 @@ def build_parser():
 
     sp_listtags = subt.add_parser("list", help="List tags with counts")
     sp_listtags.add_argument("--group", "-g", help="Filter by group")
+    sp_listtags.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort order (default: count-desc)")
+    sp_listtags.add_argument("--top", type=int, help="Limit number of tags shown")
     sp_listtags.set_defaults(func=cmd_tags_list)
 
     sp_items = subt.add_parser("items", help="List items for a tag or tag set")
@@ -2835,20 +3695,28 @@ def build_parser():
     sp_items.add_argument("--show-path", action="store_true", help="Show expected file path as indented metadata")
     sp_items.add_argument("--show-date", action="store_true", help="Show published date as indented metadata")
     sp_items.add_argument("--show-snippet", action="store_true", help="Show a short text snippet under each item")
+    sp_items.add_argument("--show-source", action="store_true", help="Show the source (title or URL) as an indented metadata line")
+    sp_items.add_argument("--color", action="store_true", help="Colorize output")
+    sp_items.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output (overrides --color and config)")
     sp_items.set_defaults(func=cmd_tags_items)
 
     sp_map = subt.add_parser("map", help="Show tags with their items")
     sp_map.add_argument("--group", "-g", help="Filter by group")
     sp_map.add_argument("--top", type=int, help="Show only the top N tags by count")
+    sp_map.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
+    sp_map.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort tags (default: count-desc)")
     sp_map.add_argument("--max-per-tag", type=int, default=10, help="Max items to list per tag (default: 10)")
     sp_map.add_argument("--compact", action="store_true", help="Compact Python-list style: tag (count): [id, ...]")
     sp_map.add_argument("--detailed", action="store_true", help="Show detailed lines with title/group/date")
+    sp_map.add_argument("--color", action="store_true", help="Colorize printed outputs")
     sp_map.set_defaults(func=cmd_tags_map)
 
     # tags compact: all tags in a single line, super compact
     sp_cmap = subt.add_parser("compact", help="One-line compact tag map: tag(count): [ids]; ...")
     sp_cmap.add_argument("--group", "-g", help="Filter by group")
     sp_cmap.add_argument("--top", type=int, help="Show only the top N tags by count")
+    sp_cmap.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
+    sp_cmap.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort tags (default: count-desc)")
     sp_cmap.add_argument("--max-per-tag", type=int, default=10, help="Max items to include per tag (default: 10)")
     sp_cmap.add_argument("--color", action="store_true", help="Colorize tag names and counts")
     sp_cmap.set_defaults(func=cmd_tags_compact)
@@ -2861,8 +3729,10 @@ def build_parser():
     sp_aid.add_argument("--undo", action="store_true", help="Unarchive (restore)")
     sp_aid.set_defaults(func=cmd_archive_id)
 
-    sp_asrc = suba.add_parser("source", help="Archive or unarchive a source (by URL)")
-    sp_asrc.add_argument("--url", required=True)
+    sp_asrc = suba.add_parser("source", help="Archive or unarchive a source (by URL or ID)")
+    mx_src = sp_asrc.add_mutually_exclusive_group(required=True)
+    mx_src.add_argument("--url")
+    mx_src.add_argument("--id", type=int)
     sp_asrc.add_argument("--undo", action="store_true", help="Unarchive (include in fetch again)")
     sp_asrc.add_argument("--delete-items", action="store_true", help="Also mark all existing items from this source as deleted")
     sp_asrc.set_defaults(func=cmd_archive_source)
@@ -2888,6 +3758,102 @@ def build_parser():
     sp_ad.add_argument("--source", help="Filter by source (url or numeric id)")
     sp_ad.add_argument("--undo", action="store_true", help="Unarchive (restore) instead of archive")
     sp_ad.set_defaults(func=cmd_archive_date)
+
+    # delete: soft-delete items separate from archive
+    sp_del = sub.add_parser("delete", help="Soft-delete items")
+    subd = sp_del.add_subparsers(dest="del_cmd", required=True)
+    sp_did = subd.add_parser("id", help="Delete or undelete item by id")
+    sp_did.add_argument("id", type=int)
+    sp_did.add_argument("--undo", action="store_true", help="Undelete instead of delete")
+    sp_did.add_argument("--force", action="store_true", help="Allow deleting starred items")
+    sp_did.set_defaults(func=cmd_delete_id)
+
+    sp_dsrc = subd.add_parser("source", help="Delete or undelete items by source (by URL or ID)")
+    mx_dsrc = sp_dsrc.add_mutually_exclusive_group(required=True)
+    mx_dsrc.add_argument("--url")
+    mx_dsrc.add_argument("--id", type=int)
+    sp_dsrc.add_argument("--undo", action="store_true", help="Undelete instead of delete")
+    sp_dsrc.add_argument("--force", action="store_true", help="Allow deleting starred items")
+    sp_dsrc.set_defaults(func=cmd_delete_source)
+
+    # purge: permanently delete data and vacuum
+    sp_purge = sub.add_parser("purge", help="Permanently delete items and clean DB")
+    sp_purge.add_argument("--deleted", action="store_true", help="Permanently remove items marked as deleted")
+    sp_purge.add_argument("--before", help="Also remove read, non-starred items older than date/time (e.g., 2023-01-01 or 'yesterday')")
+    sp_purge.add_argument("--older-days", type=int, help="Also remove read, non-starred items older than N days")
+    sp_purge.add_argument("--group", "-g", help="Restrict purge to group(s) (comma/space separated)")
+    sp_purge.add_argument("--source", help="Restrict purge to a source (url or numeric id)")
+    sp_purge.add_argument("--source-id", type=int, help="Restrict purge to a source by numeric id (explicit)")
+    sp_purge.add_argument("--clean-tags", action="store_true", help="Remove tags that no longer have any items")
+    sp_purge.add_argument("--vacuum", action="store_true", help="VACUUM the database to reclaim disk space")
+    sp_purge.add_argument("--dry-run", action="store_true", help="Show what would be removed without deleting")
+    sp_purge.set_defaults(func=cmd_purge)
+
+    # purge shortcuts
+    sp_pdel = sub.add_parser("purge-deleted", help="Shortcut: purge deleted items (optional: scope and cleanup)")
+    sp_pdel.add_argument("--group", "-g", help="Restrict to group(s)")
+    sp_pdel.add_argument("--source", help="Restrict to a source (url or numeric id)")
+    sp_pdel.add_argument("--source-id", type=int, help="Restrict to a source by numeric id")
+    sp_pdel.add_argument("--clean-tags", action="store_true")
+    sp_pdel.add_argument("--vacuum", action="store_true")
+    sp_pdel.add_argument("--dry-run", action="store_true")
+    sp_pdel.set_defaults(func=lambda a: cmd_purge(argparse.Namespace(deleted=True, before=None, older_days=None, group=a.group, source=a.source, source_id=a.source_id, clean_tags=a.clean_tags, vacuum=a.vacuum, dry_run=a.dry_run)))
+
+    # source management
+    sp_src = sub.add_parser("source", help="Manage sources (DB)")
+    subs = sp_src.add_subparsers(dest="source_cmd", required=True)
+    sp_rm = subs.add_parser("rm", help="Remove a source (and its items) from the DB")
+    mx_rm = sp_rm.add_mutually_exclusive_group(required=True)
+    mx_rm.add_argument("--url")
+    mx_rm.add_argument("--id", type=int)
+    sp_rm.add_argument("--yes", action="store_true", help="Confirm removal (non-interactive)")
+    sp_rm.add_argument("--vacuum", action="store_true", help="VACUUM after removal")
+    sp_rm.set_defaults(func=cmd_source_rm)
+
+    # --- Simple aliases for common flows ---
+    # a: archive source by id/url
+    sp_a = sub.add_parser("a", help="Alias: archive source by id/url (use --id or --url)")
+    mx_a = sp_a.add_mutually_exclusive_group(required=True)
+    mx_a.add_argument("--id", type=int)
+    mx_a.add_argument("--url")
+    sp_a.add_argument("--undo", action="store_true")
+    sp_a.add_argument("--delete-items", action="store_true")
+    sp_a.set_defaults(func=cmd_archive_source)
+
+    # rm: remove source from DB by id/url
+    sp_rm2 = sub.add_parser("rm", help="Alias: remove a source from DB (and its items)")
+    mx_rm2 = sp_rm2.add_mutually_exclusive_group(required=True)
+    mx_rm2.add_argument("--id", type=int)
+    mx_rm2.add_argument("--url")
+    sp_rm2.add_argument("--yes", action="store_true")
+    sp_rm2.add_argument("--vacuum", action="store_true")
+    sp_rm2.set_defaults(func=cmd_source_rm)
+
+    # trash: soft-delete items (alias of delete)
+    sp_tr = sub.add_parser("trash", help="Alias: soft-delete items")
+    subtr = sp_tr.add_subparsers(dest="trash_cmd", required=True)
+    sp_trid = subtr.add_parser("id", help="Delete or undelete item by id")
+    sp_trid.add_argument("id", type=int)
+    sp_trid.add_argument("--undo", action="store_true")
+    sp_trid.add_argument("--force", action="store_true")
+    sp_trid.set_defaults(func=cmd_delete_id)
+    sp_trsrc = subtr.add_parser("source", help="Delete or undelete items by source")
+    mx_trs = sp_trsrc.add_mutually_exclusive_group(required=True)
+    mx_trs.add_argument("--id", type=int)
+    mx_trs.add_argument("--url")
+    sp_trsrc.add_argument("--undo", action="store_true")
+    sp_trsrc.add_argument("--force", action="store_true")
+    sp_trsrc.set_defaults(func=cmd_delete_source)
+
+    # pd: purge-deleted shortcut
+    sp_pd = sub.add_parser("pd", help="Alias: purge deleted items (optional: scope and cleanup)")
+    sp_pd.add_argument("--group", "-g")
+    sp_pd.add_argument("--source")
+    sp_pd.add_argument("--source-id", type=int)
+    sp_pd.add_argument("--clean-tags", action="store_true")
+    sp_pd.add_argument("--vacuum", action="store_true")
+    sp_pd.add_argument("--dry-run", action="store_true")
+    sp_pd.set_defaults(func=lambda a: cmd_purge(argparse.Namespace(deleted=True, before=None, older_days=None, group=a.group, source=a.source, source_id=a.source_id, clean_tags=a.clean_tags, vacuum=a.vacuum, dry_run=a.dry_run)))
 
     return p
 
