@@ -10,6 +10,8 @@ import tempfile
 import subprocess
 import tarfile
 import io
+import hashlib
+import socket
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -106,6 +108,12 @@ def full_config_template() -> str:
         "new_hours = \"24\"\n\n"
         "# list default max items (used when --limit not set)\n"
         "list_max = \"2000\"\n\n"
+        "# Tiered fetch intervals (hours); 1 = highest frequency, 5 = lowest\n"
+        "fetch_tier1_hours = \"1\"\n"
+        "fetch_tier2_hours = \"3\"\n"
+        "fetch_tier3_hours = \"6\"\n"
+        "fetch_tier4_hours = \"12\"\n"
+        "fetch_tier5_hours = \"24\"\n\n"
         "# copy defaults\n"
         "# part: url|title|summary|content\n"
         "copy_default_part = \"url\"\n"
@@ -161,6 +169,9 @@ def resolve_display_opts(args) -> dict:
             "--show-date": "date",
             "--show-snippet": "snippet",
             "--show-source": "source",
+            "--show-meta": "meta",
+            "--show-meta-data": "meta",
+            "--show-guid": "meta",
         }
         order: list[str] = []
         for tok in argv:
@@ -187,6 +198,8 @@ def resolve_display_opts(args) -> dict:
         "show_date": opt("show_date"),
         "show_snippet": opt("show_snippet"),
         "show_source": opt("show_source"),
+        "show_meta": getattr(args, "show_meta", False) or getattr(args, "show_meta_data", False),
+        "show_guid": getattr(args, "show_guid", False),
         "color": color_enabled,
         "order": order,
         "snippet_len": snippet_len,
@@ -294,9 +307,19 @@ def parse_sources_file(text: str) -> list[dict]:
             continue
         title = obj.get("title")
         groups = obj.get("groups") or []
+        # Normalize tier to int 1..5 (default 3)
+        raw_tier = obj.get("tier")
+        tier: int | None = None
+        try:
+            if raw_tier is not None:
+                tier = int(str(raw_tier).strip())
+        except Exception:
+            tier = None
+        if tier is None or tier < 1 or tier > 5:
+            tier = 3
         if not isinstance(groups, list):
             groups = []
-        out.append({"url": url, "title": title, "groups": [g for g in groups if isinstance(g, str)]})
+        out.append({"url": url, "title": title, "groups": [g for g in groups if isinstance(g, str)], "tier": tier})
     return out
 
 
@@ -313,6 +336,11 @@ def read_config() -> dict:
         "external_export_format": "md",
         "new_hours": "24",
         "list_max": "2000",
+        "fetch_tier1_hours": "1",
+        "fetch_tier2_hours": "3",
+        "fetch_tier3_hours": "6",
+        "fetch_tier4_hours": "12",
+        "fetch_tier5_hours": "24",
         "editor": None,
         "clipboard_cmd": None,
     }
@@ -354,7 +382,10 @@ def init_db(conn: sqlite3.Connection):
         CREATE TABLE IF NOT EXISTS feeds (
             url TEXT PRIMARY KEY,
             grp TEXT NOT NULL,
-            title TEXT
+            title TEXT,
+            favorite INTEGER DEFAULT 0,
+            tier TEXT DEFAULT 'normal',
+            last_fetch_ts INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS feed_groups (
             url TEXT NOT NULL,
@@ -366,6 +397,7 @@ def init_db(conn: sqlite3.Connection):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             feed_url TEXT NOT NULL,
             guid TEXT,
+            uid TEXT,
             title TEXT,
             link TEXT,
             summary TEXT,
@@ -395,6 +427,11 @@ def init_db(conn: sqlite3.Connection):
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(items)")
     cols = {r[1] for r in cur.fetchall()}  # r[1] is name
+    if "uid" not in cols:
+        try:
+            cur.execute("ALTER TABLE items ADD COLUMN uid TEXT")
+        except Exception:
+            pass
     if "starred" not in cols:
         cur.execute("ALTER TABLE items ADD COLUMN starred INTEGER DEFAULT 0")
     if "deleted" not in cols:
@@ -414,6 +451,21 @@ def init_db(conn: sqlite3.Connection):
             cur.execute("ALTER TABLE feeds ADD COLUMN archived INTEGER DEFAULT 0")
         except Exception:
             pass
+    if "favorite" not in fcols:
+        try:
+            cur.execute("ALTER TABLE feeds ADD COLUMN favorite INTEGER DEFAULT 0")
+        except Exception:
+            pass
+    if "tier" not in fcols:
+        try:
+            cur.execute("ALTER TABLE feeds ADD COLUMN tier TEXT DEFAULT 'normal'")
+        except Exception:
+            pass
+    if "last_fetch_ts" not in fcols:
+        try:
+            cur.execute("ALTER TABLE feeds ADD COLUMN last_fetch_ts INTEGER DEFAULT 0")
+        except Exception:
+            pass
     conn.commit()
     # Helpful indexes for common queries
     conn.executescript(
@@ -425,6 +477,7 @@ def init_db(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag_id);
         CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_id);
         CREATE INDEX IF NOT EXISTS idx_feeds_archived ON feeds(archived);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_items_feed_uid ON items(feed_url, uid);
         """
     )
     conn.commit()
@@ -547,11 +600,40 @@ def cmd_sources(args):
 
 def http_get(url: str, timeout: int = 15) -> bytes | None:
     try:
-        req = Request(url, headers={"User-Agent": "rssel/0.1"})
+        req = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; rssel/0.1; +https://github.com/openai/codex-cli)",
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8",
+            },
+        )
         with urlopen(req, timeout=timeout) as resp:
             return resp.read()
-    except (URLError, HTTPError) as e:
+    except (URLError, HTTPError, TimeoutError, socket.timeout) as e:
         print(f"Fetch error {url}: {e}", file=sys.stderr)
+        return None
+
+
+def _fetch_with_debug(url: str, timeout: int, debug: bool) -> bytes | None:
+    if not debug:
+        return http_get(url, timeout=timeout)
+    try:
+        print(f"[fetch] GET {url}")
+        req = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; rssel/0.1; +https://github.com/openai/codex-cli)",
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8",
+            },
+        )
+        with urlopen(req, timeout=timeout) as resp:
+            ctype = resp.headers.get("Content-Type", "?")
+            status = getattr(resp, "status", None)
+            data = resp.read()
+            print(f"[fetch] status={status} content-type={ctype} bytes={len(data)}")
+            return data
+    except (URLError, HTTPError, TimeoutError, socket.timeout) as e:
+        print(f"[fetch] error {url}: {e}", file=sys.stderr)
         return None
 
 
@@ -652,14 +734,24 @@ def upsert_feeds(conn: sqlite3.Connection, entries: list[dict], only_group: str 
         if only_group and only_group not in groups:
             continue
         primary = groups[0] if groups else "ungrouped"
+        tier_val = e.get("tier") or 3
         cur.execute(
-            "INSERT INTO feeds(url, grp, title) VALUES(?, ?, ?) ON CONFLICT(url) DO UPDATE SET grp=excluded.grp, title=COALESCE(excluded.title, feeds.title)",
-            (url, primary, title),
+            "INSERT INTO feeds(url, grp, title, tier) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(url) DO UPDATE SET grp=excluded.grp, title=COALESCE(excluded.title, feeds.title), "
+            "tier=COALESCE(excluded.tier, feeds.tier)",
+            (url, primary, title, str(tier_val)),
         )
         for g in (groups or [primary]):
             if only_group and g != only_group:
                 continue
             cur.execute("INSERT OR IGNORE INTO feed_groups(url, grp) VALUES(?, ?)", (url, g))
+        # If this feed previously lived in the synthetic 'ungrouped' bucket,
+        # remove that association once explicit groups are provided in config.
+        if groups:
+            try:
+                cur.execute("DELETE FROM feed_groups WHERE url = ? AND grp = 'ungrouped'", (url,))
+            except Exception:
+                pass
     conn.commit()
 
 
@@ -668,19 +760,116 @@ def cmd_fetch(args):
     if not entries:
         print("No sources configured. Run 'rssel init'.", file=sys.stderr)
         return 1
+    # Color helper
+    use_color = bool(getattr(args, "color", False)) and not bool(getattr(args, "nocolor", False))
+    def c(text, *codes):
+        return _maybe(text, use_color, *codes)
+    # Validate duplicate URLs in sources
+    urls = [e.get("url") for e in entries if e.get("url")]
+    seen: dict[str,int] = {}
+    dups: set[str] = set()
+    for u in urls:
+        seen[u] = seen.get(u, 0) + 1
+        if seen[u] > 1:
+            dups.add(u)
+    if dups:
+        print("Duplicate source URLs in config; aborting fetch:", file=sys.stderr)
+        for u in sorted(dups):
+            print(f"  {u} (count={seen[u]})", file=sys.stderr)
+        return 1
     conn = db_conn()
     init_db(conn)
-    upsert_feeds(conn, entries, args.group)
+    # Ensure feeds exist in DB. If explicit --id/--ids/--source is used,
+    # upsert all sources regardless of group so the target is present.
+    if getattr(args, "id", None) is not None or getattr(args, "ids", None) or getattr(args, "source", None):
+        upsert_feeds(conn, entries, None)
+    else:
+        upsert_feeds(conn, entries, args.group)
     cur = conn.cursor()
-    if args.group:
-        glist = _parse_groups_arg(args.group)
-        placeholders = ",".join(["?"] * len(glist)) if glist else "?"
-        sql = f"SELECT DISTINCT f.url FROM feeds f JOIN feed_groups g ON g.url = f.url WHERE g.grp IN ({placeholders}) AND f.archived = 0"
-        cur.execute(sql, glist or [args.group])
+    feed_urls: list[str] = []
+    # Collect URLs from --id/--ids/--source
+    if getattr(args, "id", None) is not None or getattr(args, "ids", None) or getattr(args, "source", None):
+        # Single-source selection by id or url
+        urls_set: set[str] = set()
+        # --id
+        if getattr(args, "id", None) is not None:
+            cur.execute("SELECT url FROM feeds WHERE rowid = ? AND archived = 0", (int(args.id),))
+            row = cur.fetchone()
+            if row and row[0]:
+                urls_set.add(row[0])
+        # --ids (comma/space separated)
+        if getattr(args, "ids", None):
+            try:
+                id_tokens = [s for s in re.split(r"[,\s]+", args.ids) if s]
+                id_list = [int(s) for s in id_tokens]
+                if id_list:
+                    placeholders = ",".join(["?"] * len(id_list))
+                    cur.execute(f"SELECT url FROM feeds WHERE rowid IN ({placeholders}) AND archived = 0", id_list)
+                    urls_set.update(u for (u,) in cur.fetchall() if u)
+            except Exception:
+                pass
+        # --source (url or numeric id string)
+        if getattr(args, "source", None):
+            src = args.source
+            try:
+                rid = int(src)
+                cur.execute("SELECT url FROM feeds WHERE rowid = ? AND archived = 0", (rid,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    urls_set.add(row[0])
+            except Exception:
+                # assume URL; ensure it's present in DB (minimal insert)
+                cur.execute("SELECT archived FROM feeds WHERE url = ?", (src,))
+                r = cur.fetchone()
+                if r is None:
+                    try:
+                        cur.execute("INSERT OR IGNORE INTO feeds(url, grp, title, tier) VALUES(?, ?, ?, ?)", (src, 'ungrouped', None, '3'))
+                        conn.commit()
+                    except Exception:
+                        pass
+                cur.execute("SELECT 1 FROM feeds WHERE url = ? AND archived = 0", (src,))
+                if cur.fetchone():
+                    urls_set.add(src)
+        feed_urls = list(urls_set)
+    elif args.group or getattr(args, "tier", None):
+        # Build candidate feed list with group/tier filters
+        where = ["archived = 0"]
+        params: list = []
+        if args.group:
+            glist = _parse_groups_arg(args.group)
+            if glist:
+                placeholders = ",".join(["?"] * len(glist))
+                where.append(f"url IN (SELECT url FROM feed_groups WHERE grp IN ({placeholders}))")
+                params.extend(glist)
+        if getattr(args, "tier", None):
+            tiers = []
+            for t in re.split(r"[,\s]+", args.tier):
+                t = t.strip()
+                if not t:
+                    continue
+                try:
+                    ti = int(t)
+                    if 1 <= ti <= 5:
+                        tiers.append(str(ti))
+                except Exception:
+                    continue
+            if tiers:
+                placeholders = ",".join(["?"] * len(tiers))
+                where.append(f"COALESCE(tier,'3') IN ({placeholders})")
+                params.extend(tiers)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        cur.execute(f"SELECT url, COALESCE(tier,'normal'), COALESCE(last_fetch_ts,0) FROM feeds {where_sql}", params)
+        rows = cur.fetchall()
+        feed_urls = [u for (u, _, __) in rows]
     else:
         cur.execute("SELECT url FROM feeds WHERE archived = 0")
-    feed_urls = [r[0] for r in cur.fetchall()]
+        feed_urls = [r[0] for r in cur.fetchall()]
+    if getattr(args, "debug", False):
+        print(c(f"[fetch] selected {len(feed_urls)} feed(s)", 2))
+        for u in feed_urls:
+            print("  - " + c(u, 36))
     total_new = 0
+    now_ts_all = int(datetime.now().timestamp())
     for url in feed_urls:
         # Count existing items for this feed before insert
         try:
@@ -688,20 +877,34 @@ def cmd_fetch(args):
             before_count = (cur.fetchone() or (0,))[0]
         except Exception:
             before_count = None
-        raw = http_get(url)
+        raw = _fetch_with_debug(url, timeout=(int(getattr(args, "timeout", 15) or 15)), debug=getattr(args, "debug", False))
         if raw is None:
+            if getattr(args, "debug", False):
+                print(f"[fetch] skip {url} due to fetch error", file=sys.stderr)
             continue
         items = parse_feed(url, raw)
+        if getattr(args, "debug", False):
+            # crude check for HTML
+            try:
+                head = raw[:256].decode("utf-8", errors="ignore").lower()
+                if "<html" in head:
+                    print(c("[fetch] note: content looks like HTML for ", 33) + c(url, 36) + c(f"; parsed_items={len(items)}", 33))
+            except Exception:
+                pass
         now_ts = int(datetime.now().timestamp())
         for it in items:
+            # Compute stable uid for duplicate blocking
+            base = (it.get("guid") or it.get("link") or it.get("title") or "").strip()
+            uid = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest() if base else None
             cur.execute(
                 """
-                INSERT OR IGNORE INTO items(feed_url, guid, title, link, summary, content, published_ts, created_ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO items(feed_url, guid, uid, title, link, summary, content, published_ts, created_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     it["feed_url"],
                     it.get("guid"),
+                    uid,
                     it.get("title"),
                     it.get("link"),
                     it.get("summary"),
@@ -722,8 +925,15 @@ def cmd_fetch(args):
         else:
             delta_new = 0
         total_new += delta_new
-        print(f"Fetched {url}: {len(items)} items, new {delta_new}")
-    print(f"Done. Total new items inserted: {total_new}")
+        new_col = 32 if delta_new > 0 else 33
+        print(c("Fetched ", 2) + c(url, 36) + c(": ", 2) + c(f"{len(items)}", 2) + c(" items, new ", 2) + c(str(delta_new), new_col, 1))
+        # Update last_fetch_ts
+        try:
+            cur.execute("UPDATE feeds SET last_fetch_ts = ? WHERE url = ?", (int(datetime.now().timestamp()), url))
+            conn.commit()
+        except Exception:
+            pass
+    print(c("Done. Total new items inserted: ", 2) + c(str(total_new), 32 if total_new > 0 else 33, 1))
     return 0
 
 
@@ -773,6 +983,21 @@ def _print_meta_block(conn: sqlite3.Connection, item: dict, dt: str, opts: dict)
                     src_name = None
             src_name = src_name or feed_url or ""
             kv("source", src_name, 36, 36)
+        elif field == "meta" and (opts.get("show_meta") or opts.get("show_meta_data")):
+            # Show GUID and UID if available
+            uid_val = (item or {}).get("uid") or ""
+            guid_val = (item or {}).get("guid") or ""
+            if uid_val:
+                kv("uid", uid_val, 35, 35)
+            if guid_val:
+                kv("guid", guid_val, 35, 35)
+        elif field == "meta" and (opts.get("show_meta") or opts.get("show_meta_data")):
+            uid_val = (item or {}).get("uid") or ""
+            guid_val = (item or {}).get("guid") or ""
+            if uid_val:
+                kv("uid", uid_val, 35, 35)
+            if guid_val:
+                kv("guid", guid_val, 35, 35)
 
 
 def cmd_list(args):
@@ -794,11 +1019,11 @@ def cmd_list(args):
             order_by = "feeds.grp COLLATE NOCASE, name COLLATE NOCASE"
         elif getattr(args, "sort_name", False):
             order_by = "name COLLATE NOCASE"
-        cur.execute(f"SELECT rowid, url, COALESCE(title, url) as name, archived FROM feeds ORDER BY {order_by}")
+        cur.execute(f"SELECT rowid, url, COALESCE(title, url) as name, archived, COALESCE(tier,'3') as tier FROM feeds ORDER BY {order_by}")
         feeds_rows = cur.fetchall()
         # Build rows with counts, last date, top tags
         data = []
-        for (rid, url, name, archived) in feeds_rows:
+        for (rid, url, name, archived, tier) in feeds_rows:
             # Count items and last published date
             cur.execute("SELECT COUNT(*), MAX(published_ts) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
             row = cur.fetchone() or (0, None)
@@ -820,24 +1045,25 @@ def cmd_list(args):
                 (url,),
             )
             tag_list = [r[0] for r in cur.fetchall()]
-            data.append((rid, name, url, archived, count, last, tag_list))
+            data.append((rid, name, url, archived, count, last, tag_list, str(tier)))
         # Pretty print as a simple table
         id_w = 4
         items_w = 6
-        state_w = 9  # 'ARCHIVED' or 'ACTIVE'
+        tier_w = 4
         last_w = 16
-        name_w = 32
+        name_w = 28
         url_w = 42
         def trunc(s, w):
             s = str(s)
             return s if len(s) <= w else (s[: w - 1] + "…")
-        header = f"{'ID':>{id_w}}  {'Items':>{items_w}}  {'Last':<{last_w}}  {'Name':<{name_w}}  {'URL':<{url_w}}  Tags"
+        header = f"{'ID':>{id_w}}  {'Items':>{items_w}}  {'Tier':<{tier_w}}  {'Last':<{last_w}}  {'Name':<{name_w}}  {'URL':<{url_w}}  Tags"
         print(_maybe(header, opts.get('color'), 2))
         print("-" * len(header))
-        for (rid, name, url, archived, count, last, tags) in data:
+        for (rid, name, url, archived, count, last, tags, tier) in data:
             id_s = _maybe(f"{rid:>{id_w}d}", opts.get('color'), 2)
             items_s = _maybe(f"{count:>{items_w}d}", opts.get('color'), 2)
             last_s = _maybe(f"{trunc(last, last_w):<{last_w}}", opts.get('color'), 2)
+            tier_s = _maybe(f"{tier:<{tier_w}}", opts.get('color'), 2)
             # Name with optional colored [archived] suffix, keeping column width
             if archived:
                 suffix = _maybe(" [archived]", opts.get('color'), 31)
@@ -848,7 +1074,7 @@ def cmd_list(args):
                 name_s = _maybe(f"{trunc(name, name_w):<{name_w}}", opts.get('color'), 1)
             url_s = _maybe(f"{trunc(url, url_w):<{url_w}}", opts.get('color'), 36)
             tags_s = ", ".join(_maybe(t, opts.get('color'), 33) for t in tags)
-            print(f"{id_s}  {items_s}  {last_s}  {name_s}  {url_s}  [" + tags_s + "]")
+            print(f"{id_s}  {items_s}  {tier_s}  {last_s}  {name_s}  {url_s}  [" + tags_s + "]")
         return 0
     # Optional: list all tags with counts
     if getattr(args, "list_tags", False):
@@ -893,6 +1119,23 @@ def cmd_list(args):
         placeholders = ",".join(["?"] * len(glist))
         where.append(f"items.feed_url IN (SELECT url FROM feed_groups WHERE grp IN ({placeholders}))")
         params.extend(glist)
+    # Optional tier filter (comma/space separated list of 1..5)
+    if getattr(args, "tier", None):
+        tiers: list[str] = []
+        for t in re.split(r"[,\s]+", args.tier):
+            t = t.strip()
+            if not t:
+                continue
+            try:
+                ti = int(t)
+                if 1 <= ti <= 5:
+                    tiers.append(str(ti))
+            except Exception:
+                continue
+        if tiers:
+            placeholders = ",".join(["?"] * len(tiers))
+            where.append(f"COALESCE(feeds.tier,'3') IN ({placeholders})")
+            params.extend(tiers)
     # Filter by source (id or url)
     src = getattr(args, "source", None)
     if src:
@@ -990,7 +1233,7 @@ def cmd_list(args):
     else:  # default or --sort-date-new
         order_by = f"{ts_field} DESC, items.id DESC"
     sql = f"""
-        SELECT items.id, items.published_ts, items.read, feeds.grp, items.title, items.feed_url
+        SELECT items.id, {ts_field} AS ts, items.read, feeds.grp, items.title, items.feed_url
         FROM items JOIN feeds ON items.feed_url = feeds.url
         {where_sql}
         ORDER BY {order_by}
@@ -1076,6 +1319,8 @@ def cmd_list(args):
             want_date = bool(getattr(args, "show_date", False))
             want_snip = bool(getattr(args, "show_snippet", False))
             want_src = bool(getattr(args, "show_source", False))
+            want_meta = bool(getattr(args, "show_meta", False) or getattr(args, "show_meta_data", False))
+            want_guid = bool(getattr(args, "show_guid", False)) or want_meta
 
             # Build object (base fields are always included)
             obj = {
@@ -1100,6 +1345,10 @@ def cmd_list(args):
                 obj["tags"] = tags[:]
             if want_snip:
                 obj["snippet"] = snippet
+            if want_meta:
+                obj["uid"] = (item or {}).get("uid")
+            if want_guid:
+                obj["guid"] = (item or {}).get("guid")
 
             # JSON output intentionally does not inject ANSI color codes into fields;
             # downstream JSON tooling should receive plain strings. Use non-JSON modes
@@ -1132,13 +1381,15 @@ def cmd_list(args):
         col_groups = 20
         # In grid mode, ignore generic --show-* flags by default to reduce clutter.
         # Users can explicitly choose metadata rows with --grid-meta.
-        allowed_meta = {"date", "path", "url", "tags", "source", "snippet"}
+        allowed_meta = {"date", "path", "url", "tags", "source", "snippet", "meta"}
         raw_meta = getattr(args, "grid_meta", None) or ""
         meta_rows = [s for s in re.split(r"[,\s]+", raw_meta) if s]
         meta_rows = [m for m in meta_rows if m in allowed_meta]
         source_cache: dict[str, str] = {}
     shown_count = 0
-    for (iid, ts, read, grp, title, feed_url) in rows:
+
+    def _process_row(iid, ts, read, grp, title, feed_url):
+        nonlocal shown_count, opts
         # Evaluate highlight state if requested
         is_hl = False
         if do_highlight and hl_terms:
@@ -1159,8 +1410,7 @@ def cmd_list(args):
                         is_hl = True
                         break
         if getattr(args, "highlight_only", False) and not is_hl:
-            continue
-
+            return
         mark = " " if read else "*"
         hmark = "!" if is_hl else " "
         dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
@@ -1174,23 +1424,15 @@ def cmd_list(args):
         if not groups:
             groups = [grp] if grp else []
         grp_label = "[" + ",".join(groups) + "]"
-        # Build base strings
         id_s = _maybe(str(iid), opts["color"], 2)
         mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
         hmark_s = _maybe(hmark, opts["color"] and hmark == "!", 31, 1) if hmark.strip() else hmark
         marks = mark_s + hmark_s
         grp_s = _maybe(grp_label, opts["color"], 36)
-        # Highlighted items: color title differently (magenta + bold)
-        if is_hl:
-            title_s = _maybe(title or '', opts["color"], 35, 1)
-        else:
-            title_s = _maybe(title or '', opts["color"], 1)
+        title_s = _maybe(title or '', opts["color"], 35, 1) if is_hl else _maybe(title or '', opts["color"], 1)
         dt_s = _maybe(dt, opts["color"], 2)
-
         if grid:
-            # Base row: id, marks, groups, title (no truncation; piping friendly)
             print(_pad(id_s, col_id, right=False), _pad(marks, col_marks), _truncate(grp_s, col_groups), title_s)
-            # Extra rows: id + label + value
             label_w = 10
             item = None
             for key in meta_rows:
@@ -1229,6 +1471,18 @@ def cmd_list(args):
                     if len(txt) > maxlen:
                         txt = txt[:maxlen].rstrip() + "…"
                     val = _maybe(txt, opts["color"], 90, 90)
+                elif key == "meta":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    uid_val = (item or {}).get("uid") or ""
+                    guid_val = (item or {}).get("guid") or ""
+                    if uid_val:
+                        lab_s = _maybe("uid:", opts["color"], 2)
+                        print(_pad(id_s, col_id, right=False), " ", _pad(lab_s, label_w), _maybe(uid_val, opts["color"], 35, 35))
+                    if guid_val:
+                        lab_s = _maybe("guid:", opts["color"], 2)
+                        print(_pad(id_s, col_id, right=False), " ", _pad(lab_s, label_w), _maybe(guid_val, opts["color"], 35, 35))
+                    continue
                 else:
                     val = ""
                 lab_s = _maybe(f"{label}:", opts["color"], 2)
@@ -1243,14 +1497,141 @@ def cmd_list(args):
                 print(f"{id_p} {marks} {grp_p} {dt_s}  {title_s}")
             shown_count += 1
             if opts.get("show_url") or opts.get("show_tags") or opts.get("show_path") or opts.get("show_snippet") or opts.get("show_date") or opts.get("show_source") or getattr(args, "show_source", False):
-                # pass feed_url in fallback so source lookup works
                 item = get_item(conn, iid) or {"id": iid, "link": None, "group": grp, "title": title, "feed_url": feed_url}
-                # Merge show_source flag from args into opts for order handling
                 if getattr(args, "show_source", False):
                     opts = dict(opts)
                     opts["show_source"] = True
                 _print_meta_block(conn, item, dt, opts)
-    # Summary line: number of items and elapsed time
+
+    # Group by primary group if requested
+    if getattr(args, "group_by", None) == "group":
+        group_map: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows:
+            label = grp or "ungrouped"
+            group_map.setdefault(label, []).append((iid, ts, read, grp, title, feed_url))
+        for label in sorted(group_map.keys(), key=lambda s: s.lower()):
+            header = f"[{label}] ({len(group_map[label])})"
+            print(_maybe(header, opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in group_map[label]:
+                _process_row(iid, ts, read, grp, title, feed_url)
+        t1 = time.perf_counter()
+        elapsed = t1 - t0
+        print(f"Total: {shown_count} item(s)  in {elapsed:.2f}s")
+        return 0
+
+    # Group by feed tier if requested
+    if getattr(args, "group_by", None) == "tier":
+        tier_cache: dict[str, str] = {}
+        def get_tier(url: str) -> str:
+            v = tier_cache.get(url)
+            if v is not None:
+                return v
+            try:
+                c = conn.cursor()
+                c.execute("SELECT COALESCE(tier,'3') FROM feeds WHERE url = ?", (url,))
+                row = c.fetchone()
+                v = str(row[0]) if row and row[0] is not None else '3'
+            except Exception:
+                v = '3'
+            tier_cache[url] = v
+            return v
+        group_map: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows:
+            label = get_tier(feed_url)
+            group_map.setdefault(label, []).append((iid, ts, read, grp, title, feed_url))
+        for label in sorted(group_map.keys(), key=lambda s: int(str(s)) if str(s).isdigit() else 999):
+            header = f"Tier {label} ({len(group_map[label])})"
+            print(_maybe(header, opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in group_map[label]:
+                _process_row(iid, ts, read, grp, title, feed_url)
+        t1 = time.perf_counter()
+        elapsed = t1 - t0
+        print(f"Total: {shown_count} item(s)  in {elapsed:.2f}s")
+        return 0
+
+    # Group by date buckets if requested
+    if getattr(args, "group_by", None) == "date":
+        bucket = (getattr(args, "date_bucket", None) or "day").lower()
+        def mk_bucket(ts: int | None):
+            if not ts:
+                return (0, "----")
+            d = datetime.fromtimestamp(ts)
+            if bucket == "month":
+                return (d.year * 100 + d.month, d.strftime("%Y-%m"))
+            if bucket == "week":
+                iso = d.isocalendar()
+                return (iso[0] * 100 + iso[1], f"{iso[0]}-W{iso[1]:02d}")
+            return (d.year * 10000 + d.month * 100 + d.day, d.strftime("%Y-%m-%d"))
+        group_map: dict[str, list[tuple]] = {}
+        order_map: dict[str, int] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows:
+            sk, label = mk_bucket(ts)
+            group_map.setdefault(label, []).append((iid, ts, read, grp, title, feed_url))
+            order_map[label] = sk
+        for label in sorted(group_map.keys(), key=lambda k: order_map[k], reverse=True):
+            header = f"{label} ({len(group_map[label])})"
+            print(_maybe(header, opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in group_map[label]:
+                _process_row(iid, ts, read, grp, title, feed_url)
+        # Summary line
+        t1 = time.perf_counter()
+        elapsed = t1 - t0
+        print(f"Total: {shown_count} item(s)  in {elapsed:.2f}s")
+        return 0
+
+    # Group by source (feed title/url) if requested
+    if getattr(args, "group_by", None) == "source":
+        name_cache: dict[str, str] = {}
+        def src_name(url: str) -> str:
+            val = name_cache.get(url)
+            if val is not None:
+                return val
+            try:
+                c = conn.cursor()
+                c.execute("SELECT COALESCE(title, url) FROM feeds WHERE url = ?", (url,))
+                row = c.fetchone()
+                val = row[0] if row else (url or "")
+            except Exception:
+                val = url or ""
+            name_cache[url] = val
+            return val
+        group_map: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows:
+            label = src_name(feed_url)
+            group_map.setdefault(label, []).append((iid, ts, read, grp, title, feed_url))
+        for label in sorted(group_map.keys(), key=lambda s: s.lower()):
+            header = f"{label} ({len(group_map[label])})"
+            print(_maybe(header, opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in group_map[label]:
+                _process_row(iid, ts, read, grp, title, feed_url)
+        t1 = time.perf_counter()
+        elapsed = t1 - t0
+        print(f"Total: {shown_count} item(s)  in {elapsed:.2f}s")
+        return 0
+
+    # Group by tag names if requested
+    if getattr(args, "group_by", None) == "tag":
+        group_map: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows:
+            tags = get_item_tag_names(conn, iid)
+            if not tags:
+                group_map.setdefault("(none)", []).append((iid, ts, read, grp, title, feed_url))
+            else:
+                for tg in tags:
+                    group_map.setdefault(tg, []).append((iid, ts, read, grp, title, feed_url))
+        for label in sorted(group_map.keys(), key=lambda s: s.lower()):
+            header = f"Tag: {label} ({len(group_map[label])})"
+            print(_maybe(header, opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in group_map[label]:
+                _process_row(iid, ts, read, grp, title, feed_url)
+        t1 = time.perf_counter()
+        elapsed = t1 - t0
+        print(f"Total: {shown_count} item(s)  in {elapsed:.2f}s")
+        return 0
+
+    # Default: no grouping
+    for (iid, ts, read, grp, title, feed_url) in rows:
+        _process_row(iid, ts, read, grp, title, feed_url)
     t1 = time.perf_counter()
     elapsed = t1 - t0
     print(f"Total: {shown_count} item(s)  in {elapsed:.2f}s")
@@ -1262,7 +1643,7 @@ def get_item(conn: sqlite3.Connection, item_id: int):
     cur.execute(
         """
         SELECT items.id, items.title, items.summary, items.content, items.link,
-               items.published_ts, feeds.grp, items.feed_url
+               items.published_ts, items.created_ts, feeds.grp, items.feed_url, items.guid, items.uid
         FROM items JOIN feeds ON items.feed_url = feeds.url
         WHERE items.id = ?
         """,
@@ -1271,8 +1652,157 @@ def get_item(conn: sqlite3.Connection, item_id: int):
     row = cur.fetchone()
     if not row:
         return None
-    keys = ["id", "title", "summary", "content", "link", "published_ts", "group", "feed_url"]
+    keys = ["id", "title", "summary", "content", "link", "published_ts", "created_ts", "group", "feed_url", "guid", "uid"]
     return dict(zip(keys, row))
+
+
+def cmd_stats(args):
+    conn = db_conn()
+    init_db(conn)
+    cur = conn.cursor()
+    color = getattr(args, "color", False) and not getattr(args, "nocolor", False)
+
+    def c(text, *codes):
+        return _maybe(text, color, *codes)
+
+    # Feed stats (global, not filtered by items)
+    cur.execute("SELECT COUNT(*) FROM feeds")
+    feeds_total = (cur.fetchone() or (0,))[0]
+    cur.execute("SELECT COUNT(*) FROM feeds WHERE archived = 1")
+    feeds_arch = (cur.fetchone() or (0,))[0]
+    feeds_active = feeds_total - feeds_arch
+
+    # Build item filter
+    where = []
+    params: list = []
+    # Group filter
+    if getattr(args, "group", None):
+        glist = _parse_groups_arg(args.group)
+        if glist:
+            placeholders = ",".join(["?"] * len(glist))
+            where.append(f"EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp IN ({placeholders}))")
+            params.extend(glist)
+    # Source filter (id or url)
+    if getattr(args, "source", None):
+        src = args.source
+        url_val = None
+        try:
+            rid = int(src)
+            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (rid,))
+            row = cur.fetchone()
+            if row:
+                url_val = row[0]
+        except Exception:
+            url_val = None
+        url_val = url_val or src
+        where.append("items.feed_url = ?")
+        params.append(url_val)
+    # Date filters
+    ts_field = "items.published_ts" if getattr(args, "date_field", "published") == "published" else "items.created_ts"
+    if getattr(args, "on", None):
+        day_start = _parse_date_arg(args.on)
+        if day_start is not None:
+            day_end = day_start + 24*3600
+            where.append(f"{ts_field} >= ? AND {ts_field} < ?")
+            params.extend([day_start, day_end])
+    else:
+        if getattr(args, "since", None):
+            s = _parse_date_arg(args.since)
+            if s is not None:
+                where.append(f"{ts_field} >= ?")
+                params.append(s)
+        if getattr(args, "until", None):
+            u = _parse_date_arg(args.until)
+            if u is not None:
+                where.append(f"{ts_field} < ?")
+                params.append(u)
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    # Item stats
+    cur.execute(f"SELECT COUNT(*) FROM items {where_sql}", params)
+    items_all = (cur.fetchone() or (0,))[0]
+    cur.execute(f"SELECT COUNT(*) FROM items {where_sql} AND deleted = 0" if where_sql else "SELECT COUNT(*) FROM items WHERE deleted = 0", params)
+    items_alive = (cur.fetchone() or (0,))[0]
+    cur.execute(f"SELECT COUNT(*) FROM items {where_sql} AND read = 0 AND deleted = 0" if where_sql else "SELECT COUNT(*) FROM items WHERE read = 0 AND deleted = 0", params)
+    items_unread = (cur.fetchone() or (0,))[0]
+    cur.execute(f"SELECT COUNT(*) FROM items {where_sql} AND COALESCE(starred,0) = 1 AND deleted = 0" if where_sql else "SELECT COUNT(*) FROM items WHERE COALESCE(starred,0) = 1 AND deleted = 0", params)
+    items_star = (cur.fetchone() or (0,))[0]
+    cur.execute(f"SELECT COUNT(*) FROM items {where_sql} AND deleted = 1" if where_sql else "SELECT COUNT(*) FROM items WHERE deleted = 1", params)
+    items_del = (cur.fetchone() or (0,))[0]
+    cur.execute(f"SELECT MAX({ts_field}) FROM items {where_sql}", params)
+    last_ts = (cur.fetchone() or (None,))[0]
+    last = datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M") if last_ts else "----"
+
+    # New window (from config new_hours)
+    try:
+        nh = int(read_config().get("new_hours", "24"))
+    except Exception:
+        nh = 24
+    cutoff = int(datetime.now().timestamp()) - nh*3600
+    cur.execute(
+        (f"SELECT COUNT(*) FROM items {where_sql} AND created_ts >= ?" if where_sql else "SELECT COUNT(*) FROM items WHERE created_ts >= ?"),
+        (params + [cutoff]) if params else [cutoff]
+    )
+    items_new_win = (cur.fetchone() or (0,))[0]
+
+    # Per-group counts (alive)
+    sql_groups = f"""
+        SELECT feeds.grp, COUNT(*)
+        FROM items JOIN feeds ON items.feed_url = feeds.url
+        {where_sql} {('AND' if where_sql else 'WHERE')} items.deleted = 0
+        GROUP BY feeds.grp
+        ORDER BY COUNT(*) DESC, feeds.grp
+    """
+    cur.execute(sql_groups, params)
+    groups_rows = cur.fetchall()
+
+    # Top tags (alive)
+    top = int(getattr(args, 'top', 10) or 10)
+    sql_tags = f"""
+        SELECT t.name, COUNT(*) as cnt
+        FROM tags t
+        JOIN item_tags it ON t.id = it.tag_id
+        JOIN items ON items.id = it.item_id
+        {where_sql} {('AND' if where_sql else 'WHERE')} items.deleted = 0
+        GROUP BY t.name
+        ORDER BY cnt DESC, t.name
+        LIMIT {top}
+    """
+    cur.execute(sql_tags, params)
+    tag_rows = cur.fetchall()
+
+    # Top sources (alive)
+    sql_srcs = f"""
+        SELECT COALESCE(f.title, f.url) as name, f.url, COUNT(*) as cnt, MAX(items.{ 'published_ts' if args.date_field == 'published' else 'created_ts' }) as last
+        FROM items JOIN feeds f ON items.feed_url = f.url
+        {where_sql} {('AND' if where_sql else 'WHERE')} items.deleted = 0
+        GROUP BY f.url, name
+        ORDER BY cnt DESC, name
+        LIMIT {top}
+    """
+    cur.execute(sql_srcs, params)
+    src_rows = cur.fetchall()
+
+    # Print
+    print(c("Feeds:", 1), f"total={feeds_total}", c("active=", 32) + str(feeds_active), c("archived=", 31) + str(feeds_arch))
+    print(c("Items:", 1), f"all={items_all}", c("alive=", 32) + str(items_alive), c("unread=", 33) + str(items_unread), c("starred=", 33) + str(items_star), c("deleted=", 31) + str(items_del))
+    print(c("Last: ", 2) + last, c(" new_window=", 2) + f"{items_new_win} (last {nh}h)")
+    # Groups
+    if groups_rows:
+        print(c("Groups:", 1))
+        for (g, cnt) in groups_rows:
+            print(f"  {c(g or 'ungrouped', 36)}: {cnt}")
+    # Top tags
+    if tag_rows:
+        print(c("Top tags:", 1))
+        print("  " + "; ".join([f"{c(n,33)}({cnt})" for (n, cnt) in tag_rows]))
+    # Top sources
+    if src_rows:
+        print(c("Top sources:", 1))
+        for (name, url, cnt, lts) in src_rows:
+            lstr = datetime.fromtimestamp(lts).strftime("%Y-%m-%d %H:%M") if lts else "----"
+            print(f"  {c(name,1)} {c('—',2)} {c(url,36)}  {cnt}  {c(lstr,2)}")
+    return 0
 
 
 def export_to_editor(text: str, config: dict):
@@ -2098,7 +2628,7 @@ def iter_items(conn: sqlite3.Connection, group: str | None, unread_only: bool, l
     limit_sql = f"LIMIT {int(limit)}" if limit else ""
     sql = f"""
         SELECT items.id, items.title, items.summary, items.content, items.link,
-               items.published_ts, feeds.grp
+               items.published_ts, feeds.grp, items.feed_url
         FROM items JOIN feeds ON items.feed_url = feeds.url
         {where_sql}
         ORDER BY items.published_ts DESC, items.id DESC
@@ -2113,6 +2643,7 @@ def iter_items(conn: sqlite3.Connection, group: str | None, unread_only: bool, l
             "link": row[4],
             "published_ts": row[5],
             "group": row[6],
+            "feed_url": row[7],
         }
 
 
@@ -2306,38 +2837,103 @@ def cmd_sync(args):
     Defaults to cleaned-up Markdown files under ./.rssel/fs.
     """
     # Fetch
+    use_color = bool(getattr(args, "color", False)) and not bool(getattr(args, "nocolor", False))
+    def c(text, *codes):
+        return _maybe(text, use_color, *codes)
     entries = read_sources_entries()
     if not entries:
         print("No sources configured. Run 'rssel init'.", file=sys.stderr)
         return 1
     conn = db_conn()
     init_db(conn)
-    upsert_feeds(conn, entries, args.group)
+    if getattr(args, "id", None) is not None or getattr(args, "ids", None) or getattr(args, "source", None):
+        upsert_feeds(conn, entries, None)
+    else:
+        upsert_feeds(conn, entries, args.group)
     cur = conn.cursor()
-    if args.group:
+    # Determine which feeds to fetch
+    feed_urls: list[str] = []
+    if getattr(args, "id", None) is not None or getattr(args, "ids", None) or getattr(args, "source", None):
+        urls_set: set[str] = set()
+        if getattr(args, "id", None) is not None:
+            cur.execute("SELECT url FROM feeds WHERE rowid = ? AND archived = 0", (int(args.id),))
+            row = cur.fetchone()
+            if row and row[0]:
+                urls_set.add(row[0])
+        if getattr(args, "ids", None):
+            try:
+                id_tokens = [s for s in re.split(r"[,\s]+", args.ids) if s]
+                id_list = [int(s) for s in id_tokens]
+                if id_list:
+                    placeholders = ",".join(["?"] * len(id_list))
+                    cur.execute(f"SELECT url FROM feeds WHERE rowid IN ({placeholders}) AND archived = 0", id_list)
+                    urls_set.update(u for (u,) in cur.fetchall() if u)
+            except Exception:
+                pass
+        if getattr(args, "source", None):
+            src = args.source
+            try:
+                rid = int(src)
+                cur.execute("SELECT url FROM feeds WHERE rowid = ? AND archived = 0", (rid,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    urls_set.add(row[0])
+            except Exception:
+                cur.execute("SELECT archived FROM feeds WHERE url = ?", (src,))
+                r = cur.fetchone()
+                if r is None:
+                    try:
+                        cur.execute("INSERT OR IGNORE INTO feeds(url, grp, title, tier) VALUES(?, ?, ?, ?)", (src, 'ungrouped', None, '3'))
+                        conn.commit()
+                    except Exception:
+                        pass
+                cur.execute("SELECT 1 FROM feeds WHERE url = ? AND archived = 0", (src,))
+                if cur.fetchone():
+                    urls_set.add(src)
+        feed_urls = list(urls_set)
+    elif args.group:
         glist = _parse_groups_arg(args.group)
         placeholders = ",".join(["?"] * len(glist)) if glist else "?"
         sql = f"SELECT DISTINCT f.url FROM feeds f JOIN feed_groups g ON g.url = f.url WHERE g.grp IN ({placeholders}) AND f.archived = 0"
         cur.execute(sql, glist or [args.group])
+        feed_urls = [r[0] for r in cur.fetchall()]
     else:
         cur.execute("SELECT url FROM feeds WHERE archived = 0")
-    feed_urls = [r[0] for r in cur.fetchall()]
+        feed_urls = [r[0] for r in cur.fetchall()]
+    if getattr(args, "debug", False):
+        print(c(f"[sync] selected {len(feed_urls)} feed(s)", 2))
+        for u in feed_urls:
+            print("  - " + c(u, 36))
     total_new = 0
     for url in feed_urls:
-        raw = http_get(url)
+        raw = _fetch_with_debug(url, timeout=(int(getattr(args, "timeout", 15) or 15)), debug=getattr(args, "debug", False))
         if raw is None:
             continue
         items = parse_feed(url, raw)
+        if getattr(args, "debug", False):
+            try:
+                head = raw[:256].decode("utf-8", errors="ignore").lower()
+                if "<html" in head:
+                    print(c("[sync] note: content looks like HTML for ", 33) + c(url, 36) + c(f"; parsed_items={len(items)}", 33))
+            except Exception:
+                pass
+        # Count new inserts by comparing counts before/after
+        try:
+            cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ?", (url,))
+            before_count = (cur.fetchone() or (0,))[0]
+        except Exception:
+            before_count = None
         now_ts = int(datetime.now().timestamp())
         for it in items:
             cur.execute(
                 """
-                INSERT OR IGNORE INTO items(feed_url, guid, title, link, summary, content, published_ts, created_ts)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO items(feed_url, guid, uid, title, link, summary, content, published_ts, created_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     it["feed_url"],
                     it.get("guid"),
+                    hashlib.sha1(((it.get("guid") or it.get("link") or it.get("title") or "").strip()).encode("utf-8", errors="ignore")).hexdigest() if (it.get("guid") or it.get("link") or it.get("title")) else None,
                     it.get("title"),
                     it.get("link"),
                     it.get("summary"),
@@ -2347,10 +2943,18 @@ def cmd_sync(args):
                 ),
             )
         conn.commit()
-        new_count = conn.total_changes
+        if before_count is not None:
+            try:
+                cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ?", (url,))
+                after_count = (cur.fetchone() or (0,))[0]
+                new_count = max(0, after_count - before_count)
+            except Exception:
+                new_count = 0
+        else:
+            new_count = 0
         total_new += new_count
-        print(f"Fetched {url}: {len(items)} items, new {new_count}")
-    print(f"Fetch complete. New items: {total_new}")
+        print(c("Fetched ", 2) + c(url, 36) + c(": ", 2) + c(f"{len(items)}", 2) + c(" items, new ", 2) + c(str(new_count), 32 if new_count > 0 else 33, 1))
+    print(c("Fetch complete. New items: ", 2) + c(str(total_new), 32 if total_new > 0 else 33, 1))
 
     # Auto-tagging (default configurable; --no-auto-tags disables)
     cfg = read_config()
@@ -2406,14 +3010,21 @@ def cmd_sync(args):
             tags = [t for t in tags if not (t in seen or seen.add(t))]
             replace_item_tags(conn, iid, tags)
             processed += 1
-        print(f"Auto-tagged {processed} items (max={max_tags}, include_domain={'yes' if include_domain else 'no'})")
+        print(c("Auto-tagged ", 2) + c(str(processed), 32 if processed > 0 else 33, 1) + c(f" items (max={max_tags}, include_domain={'yes' if include_domain else 'no'})", 2))
 
     # Export
     dest = os.path.abspath(args.dest)
     ensure_clean_dir(dest, args.clean)
     groups_done: set[str] = set()
     count = 0
+    allowed: set[str] | None = set(feed_urls) if (getattr(args, "id", None) is not None or getattr(args, "source", None)) else None
     for item in iter_items(conn, args.group, args.unread_only, args.limit):
+        if allowed is not None:
+            # Load feed_url for this item to filter; get_item returns feed_url
+            it = get_item(conn, item["id"]) if "feed_url" not in item else None
+            furl = (item.get("feed_url") if isinstance(item, dict) else None) or ((it or {}).get("feed_url") if it else None)
+            if furl not in allowed:
+                continue
         grp = item.get("group") or "ungrouped"
         gdir = os.path.join(dest, grp)
         if grp not in groups_done:
@@ -2422,7 +3033,7 @@ def cmd_sync(args):
         tags = get_item_tag_names(conn, item["id"]) if args.format in ("md", "txt", "json", "html") else []
         write_item_file(gdir, item, args.format, tags)
         count += 1
-    print(f"Exported {count} items to {dest} (format: {args.format})")
+    print(c("Exported ", 2) + c(str(count), 36) + c(" items to ", 2) + c(dest, 32) + c(f" (format: {args.format})", 2))
     return 0
 
 
@@ -3257,7 +3868,7 @@ def cmd_pick(args):
     """
     conn = db_conn()
     init_db(conn)
-    # Build rows like list (supports --tags)
+    # Build rows like list (supports many of the same filters)
     def build_rows(q: str | None):
         cur = conn.cursor()
         where = ["items.deleted = 0"]
@@ -3265,6 +3876,23 @@ def cmd_pick(args):
         if args.group:
             where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
             params.append(args.group)
+        # Tier filter (1..5 list)
+        if getattr(args, "tier", None):
+            tiers: list[str] = []
+            for t in re.split(r"[,\s]+", args.tier or ""):
+                t = t.strip()
+                if not t:
+                    continue
+                try:
+                    ti = int(t)
+                    if 1 <= ti <= 5:
+                        tiers.append(str(ti))
+                except Exception:
+                    continue
+            if tiers:
+                placeholders = ",".join(["?"] * len(tiers))
+                where.append(f"COALESCE(feeds.tier,'3') IN ({placeholders})")
+                params.extend(tiers)
         # tags ALL-match
         if getattr(args, "tags", None):
             tag_list = [t.strip().lower() for t in re.split(r"[,\s]+", args.tags or "") if t.strip()]
@@ -3340,7 +3968,7 @@ def cmd_pick(args):
         else:
             order_by = f"{ts_field} DESC, items.id DESC"
         sql = f"""
-            SELECT items.id, items.published_ts, items.read, feeds.grp, items.title, items.summary
+            SELECT items.id, {ts_field} AS ts, items.read, feeds.grp, items.title, items.feed_url
             FROM items JOIN feeds ON items.feed_url = feeds.url
             {where_sql}
             ORDER BY {order_by}
@@ -3358,10 +3986,12 @@ def cmd_pick(args):
         # Let user filter interactively; capture the query and re-run DB with it
         # Build lines with hidden search column (title + summary)
         fzf_lines = []
-        for (iid, ts, read, grp, title, summary) in rows:
+        for (iid, ts, read, grp, title, feed_url) in rows:
             mark = (" " if read else "*") + " "
             dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
-            txt = html_to_text(summary or "")
+            # Build a search text using title + a plain-text snippet from the item
+            it = get_item(conn, iid)
+            txt = html_to_text((it or {}).get("content") or (it or {}).get("summary") or "")
             txt = " ".join(txt.split()).replace("\t", " ")
             search = f"{title or ''} {txt}".strip()
             fzf_lines.append(f"{iid}\t{mark}\t[{grp}]\t{dt}\t{title or ''}\t{search}")
@@ -3393,27 +4023,221 @@ def cmd_pick(args):
         except FileNotFoundError:
             pass
     rows_to_print = rows
-    # Print like list
+    # Print like list: reuse list’s display helpers and grouping options (subset)
     opts = resolve_display_opts(args)
-    for (iid, ts, read, grp, title, *rest) in rows_to_print:
+    # Grid helpers reused
+    grid = getattr(args, "grid", False)
+    def _ansi_strip(s: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", s)
+    def _pad(s: str, w: int, right: bool = True) -> str:
+        clean = _ansi_strip(s)
+        extra = max(0, w - len(clean))
+        return (s + " " * extra) if right else (" " * extra + s)
+    def _truncate(s: str, w: int) -> str:
+        clean = _ansi_strip(s)
+        return clean if len(clean) <= w else (clean[: max(0, w - 1)] + "…")
+    if grid:
+        col_id, col_marks, col_groups = 6, 2, 20
+        allowed_meta = {"date", "path", "url", "tags", "source", "snippet", "meta"}
+        raw_meta = getattr(args, "grid_meta", None) or ""
+        meta_rows = [m for m in re.split(r"[,\s]+", raw_meta) if m]
+        meta_rows = [m for m in meta_rows if m in allowed_meta]
+        source_cache: dict[str, str] = {}
+
+    # Highlight
+    hl_terms: list[str] = []
+    do_highlight = getattr(args, "highlight", False) or getattr(args, "highlight_only", False)
+    if do_highlight:
+        hl_terms = load_highlight_words()
+
+    def print_row(iid, ts, read, grp, title, feed_url):
+        is_hl = False
+        if do_highlight and hl_terms:
+            it = get_item(conn, iid)
+            ttl = (it.get("title") if it else title) or ""
+            body = html_to_text((it or {}).get("content") or (it or {}).get("summary") or "")
+            low = (ttl + "\n" + body).lower()
+            for term in hl_terms:
+                t = term.strip()
+                if not t:
+                    continue
+                if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
+                    if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
+                        is_hl = True
+                        break
+                else:
+                    if t.lower() in low:
+                        is_hl = True
+                        break
+        if getattr(args, "highlight_only", False) and not is_hl:
+            return False
         mark = " " if read else "*"
+        hmark = "!" if is_hl else " "
         dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
-        if opts["show_url"] or opts["show_tags"] or opts["show_path"] or opts["show_snippet"] or opts["show_date"]:
+        if grid:
+            # compute all groups for this feed
+            try:
+                c = conn.cursor()
+                c.execute("SELECT grp FROM feed_groups WHERE url = ? ORDER BY grp", (feed_url,))
+                groups = [r[0] for r in c.fetchall()] or ([grp] if grp else [])
+            except Exception:
+                groups = [grp] if grp else []
+            grp_label = "[" + ",".join(groups) + "]"
             id_s = _maybe(str(iid), opts["color"], 2)
             mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
-            grp_s = f"[{_maybe(grp, opts["color"], 36)}]"
-            title_s = _maybe(title or '', opts["color"], 1)
-            print(f"{id_s} {mark_s} {grp_s} {title_s}")
+            hmark_s = _maybe(hmark, opts["color"] and hmark == "!", 31, 1) if hmark.strip() else hmark
+            grp_s = _maybe(grp_label, opts["color"], 36)
+            title_s = _maybe(title or '', opts["color"], 35, 1) if is_hl else _maybe(title or '', opts["color"], 1)
+            print(_pad(id_s, col_id, right=False), _pad(mark_s + hmark_s, col_marks), _truncate(grp_s, col_groups), title_s)
+            label_w = 10
+            item = None
+            for key in meta_rows:
+                label = key
+                if key == "date":
+                    val = _maybe(dt, opts["color"], 2)
+                elif key == "path":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    pth = expected_item_path(item or {"id": iid, "title": title, "group": grp}, fmt='md', dest=default_fs_dest())
+                    val = _maybe(pth, opts["color"], 32)
+                elif key == "url":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    val = (item or {}).get("link") or ""
+                elif key == "tags":
+                    tags = get_item_tag_names(conn, iid)
+                    val = _maybe(", ".join(tags), opts["color"], 33)
+                elif key == "source":
+                    name = source_cache.get(feed_url)
+                    if name is None:
+                        try:
+                            c2 = conn.cursor(); c2.execute("SELECT COALESCE(title, url) FROM feeds WHERE url = ?", (feed_url,))
+                            r = c2.fetchone(); name = r[0] if r else (feed_url or "")
+                        except Exception:
+                            name = feed_url or ""
+                        source_cache[feed_url] = name
+                    val = _maybe(name, opts["color"], 36)
+                elif key == "snippet":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    txt = html_to_text((item or {}).get("content") or (item or {}).get("summary") or "")
+                    maxlen = int(opts.get("snippet_len", 240))
+                    if len(txt) > maxlen:
+                        txt = txt[:maxlen].rstrip() + "…"
+                    val = _maybe(txt, opts["color"], 90, 90)
+                elif key == "meta":
+                    if item is None:
+                        item = get_item(conn, iid)
+                    uid_val = (item or {}).get("uid") or ""
+                    guid_val = (item or {}).get("guid") or ""
+                    if uid_val:
+                        print(_pad(id_s, col_id, right=False), " ", _pad(_maybe("uid:", opts["color"], 2), label_w), _maybe(uid_val, opts["color"], 35, 35))
+                    if guid_val:
+                        print(_pad(id_s, col_id, right=False), " ", _pad(_maybe("guid:", opts["color"], 2), label_w), _maybe(guid_val, opts["color"], 35, 35))
+                    continue
+                else:
+                    continue
+                print(_pad(id_s, col_id, right=False), " ", _pad(_maybe(f"{label}:", opts["color"], 2), label_w), val)
         else:
             id_s = _maybe(f"{iid:6d}", opts["color"], 2)
             mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
             grp_s = f"[{_maybe(grp, opts["color"], 36)}]"
             dt_s = _maybe(dt, opts["color"], 2)
-            title_s = _maybe(title or '', opts["color"], 1)
-            print(f"{id_s} {mark_s} {grp_s} {dt_s}  {title_s}")
-        if opts["show_url"] or opts["show_tags"] or opts["show_path"] or opts["show_snippet"] or opts["show_date"]:
-            item = get_item(conn, iid)
-            _print_meta_block(conn, item, dt, opts)
+            title_s = _maybe(title or '', opts["color"], 35, 1) if is_hl else _maybe(title or '', opts["color"], 1)
+            if opts["show_url"] or opts["show_tags"] or opts["show_path"] or opts["show_snippet"] or opts["show_date"]:
+                print(f"{_maybe(str(iid), opts['color'], 2)} {mark_s} {grp_s} {title_s}")
+                item = get_item(conn, iid)
+                _print_meta_block(conn, item, dt, opts)
+            else:
+                print(f"{id_s} {mark_s} {grp_s} {dt_s}  {title_s}")
+        return True
+
+    # Grouping support (subset): date/group/tier/tag/source
+    group_by = getattr(args, "group_by", None)
+    if group_by == "date":
+        bucket = (getattr(args, "date_bucket", None) or "day").lower()
+        def mk(ts):
+            if not ts:
+                return (0, "----")
+            d = datetime.fromtimestamp(ts)
+            if bucket == "month":
+                return (d.year * 100 + d.month, d.strftime("%Y-%m"))
+            if bucket == "week":
+                iso = d.isocalendar(); return (iso[0] * 100 + iso[1], f"{iso[0]}-W{iso[1]:02d}")
+            return (d.year * 10000 + d.month * 100 + d.day, d.strftime("%Y-%m-%d"))
+        groups: dict[str, list[tuple]] = {}; order: dict[str, int] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows_to_print:
+            sk, lb = mk(ts); groups.setdefault(lb, []).append((iid, ts, read, grp, title, feed_url)); order[lb] = sk
+        for lb in sorted(groups.keys(), key=lambda k: order[k], reverse=True):
+            print(_maybe(f"{lb} ({len(groups[lb])})", opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in groups[lb]:
+                print_row(iid, ts, read, grp, title, feed_url)
+        return 0
+    if group_by == "group":
+        groups: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows_to_print:
+            lb = grp or "ungrouped"; groups.setdefault(lb, []).append((iid, ts, read, grp, title, feed_url))
+        for lb in sorted(groups.keys(), key=lambda s: s.lower()):
+            print(_maybe(f"[{lb}] ({len(groups[lb])})", opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in groups[lb]:
+                print_row(iid, ts, read, grp, title, feed_url)
+        return 0
+    if group_by == "tier":
+        tier_cache: dict[str, str] = {}
+        def get_t(url: str) -> str:
+            v = tier_cache.get(url)
+            if v is not None:
+                return v
+            try:
+                c = conn.cursor(); c.execute("SELECT COALESCE(tier,'3') FROM feeds WHERE url = ?", (url,)); r = c.fetchone(); v = str(r[0]) if r and r[0] is not None else '3'
+            except Exception:
+                v = '3'
+            tier_cache[url] = v; return v
+        groups: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows_to_print:
+            lb = get_t(feed_url); groups.setdefault(lb, []).append((iid, ts, read, grp, title, feed_url))
+        for lb in sorted(groups.keys(), key=lambda s: int(str(s)) if str(s).isdigit() else 999):
+            print(_maybe(f"Tier {lb} ({len(groups[lb])})", opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in groups[lb]:
+                print_row(iid, ts, read, grp, title, feed_url)
+        return 0
+    if group_by == "source":
+        name_cache: dict[str, str] = {}
+        def src(url: str) -> str:
+            v = name_cache.get(url)
+            if v is not None:
+                return v
+            try:
+                c = conn.cursor(); c.execute("SELECT COALESCE(title, url) FROM feeds WHERE url = ?", (url,)); r = c.fetchone(); v = r[0] if r else (url or "")
+            except Exception:
+                v = url or ""
+            name_cache[url] = v; return v
+        groups: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows_to_print:
+            lb = src(feed_url); groups.setdefault(lb, []).append((iid, ts, read, grp, title, feed_url))
+        for lb in sorted(groups.keys(), key=lambda s: s.lower()):
+            print(_maybe(f"{lb} ({len(groups[lb])})", opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in groups[lb]:
+                print_row(iid, ts, read, grp, title, feed_url)
+        return 0
+    if group_by == "tag":
+        groups: dict[str, list[tuple]] = {}
+        for (iid, ts, read, grp, title, feed_url) in rows_to_print:
+            tags = get_item_tag_names(conn, iid)
+            if not tags:
+                groups.setdefault("(none)", []).append((iid, ts, read, grp, title, feed_url))
+            else:
+                for tg in tags:
+                    groups.setdefault(tg, []).append((iid, ts, read, grp, title, feed_url))
+        for lb in sorted(groups.keys(), key=lambda s: s.lower()):
+            print(_maybe(f"Tag: {lb} ({len(groups[lb])})", opts.get('color'), 1))
+            for (iid, ts, read, grp, title, feed_url) in groups[lb]:
+                print_row(iid, ts, read, grp, title, feed_url)
+        return 0
+
+    # Default: sequential print
+    for (iid, ts, read, grp, title, feed_url) in rows_to_print:
+        print_row(iid, ts, read, grp, title, feed_url)
     return 0
 
 
@@ -3434,10 +4258,21 @@ def build_parser():
 
     sp = sub.add_parser("fetch", help="Fetch feeds and cache items")
     sp.add_argument("--group", "-g", help="Only fetch this group")
+    sp.add_argument("--id", type=int, help="Only fetch this source by numeric id (rowid in DB)")
+    sp.add_argument("--ids", help="Only fetch these sources by id list (comma/space separated)")
+    sp.add_argument("--source", help="Only fetch this source by URL or numeric id string")
+    sp.add_argument("--tier", help="Only fetch feeds with this tier(s) 1-5 (comma/space)")
+    sp.add_argument("--debug", action="store_true", help="Verbose debug: print selected feeds and HTTP request details")
+    sp.add_argument("--timeout", type=int, default=15, help="HTTP timeout in seconds (default: 15)")
+    sp.add_argument("--color", action="store_true", help="Colorize output lines")
+    sp.add_argument("--nocolor", action="store_true", help="Force-disable ANSI colors in output")
     sp.set_defaults(func=cmd_fetch)
 
     sp = sub.add_parser("list", help="List cached items")
     sp.add_argument("--group", "-g", help="Filter by group")
+    sp.add_argument("--tier", help="Filter by feed tier(s) 1-5 (comma/space)")
+    sp.add_argument("--group-by", choices=["date", "group", "tier", "tag", "source"], help="Group printed output (date/group/tier/tag/source)")
+    sp.add_argument("--date-bucket", choices=["day", "week", "month"], default="day", help="Bucket for --group-by date (default: day)")
     sp.add_argument("--tags", help="Comma/space separated tag names; item must have ALL")
     sp.add_argument("--limit", "-n", type=int, help="Limit number of items")
     sp.add_argument("--unread-only", action="store_true", help="Only show unread items")
@@ -3450,6 +4285,7 @@ def build_parser():
     sp.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
     sp.add_argument("--source", help="Filter by a source (url or numeric id)")
+    sp.add_argument("--source-id", type=int, help="Filter by a source (numeric id)")
     sp.add_argument("--sources", action="store_true", help="List sources summary (ids, names, urls, counts)")
     sp.add_argument("--list-sources", action="store_true", help="Alias: list sources summary (ids, names, urls, counts)")
     sp.add_argument("--list-tags", action="store_true", help="List all tags with counts (optional: filter by --group)")
@@ -3474,6 +4310,8 @@ def build_parser():
     sp.add_argument("--show-path", action="store_true", help="Show expected file path as an indented metadata line")
     sp.add_argument("--show-date", action="store_true", help="Show published date as an indented metadata line")
     sp.add_argument("--show-snippet", action="store_true", help="Show a short text snippet under each item")
+    sp.add_argument("--show-meta", action="store_true", help="Show additional metadata like uid/guid")
+    sp.add_argument("--show-meta-data", action="store_true", help="Alias for --show-meta")
     sp.add_argument("--show-source", action="store_true", help="Show the source (title or URL) as an indented metadata line")
     sp.add_argument("--color", action="store_true", help="Colorize output (titles, groups, markers)")
     sp.add_argument("--export", action="store_true", help="Export the filtered items to files")
@@ -3563,6 +4401,14 @@ def build_parser():
     # sync: fetch + export in one go (pivot to downloader)
     sp_all = sub.add_parser("sync", help="Fetch feeds and export grouped files")
     sp_all.add_argument("--group", "-g", help="Only process this group")
+    sp_all.add_argument("--id", type=int, help="Only fetch/export this source by numeric id")
+    sp_all.add_argument("--ids", help="Only fetch/export these sources by id list (comma/space separated)")
+    sp_all.add_argument("--source", help="Only fetch/export this source by URL or numeric id string")
+    sp_all.add_argument("--tier", help="Only fetch/export feeds with this tier(s) 1-5 (comma/space)")
+    sp_all.add_argument("--debug", action="store_true", help="Verbose debug: print selected feeds and HTTP request details")
+    sp_all.add_argument("--color", action="store_true", help="Colorize output lines")
+    sp_all.add_argument("--nocolor", action="store_true", help="Force-disable ANSI colors in output")
+    sp_all.add_argument("--timeout", type=int, default=15, help="HTTP timeout in seconds (default: 15)")
     sp_all.add_argument("--dest", default=os.path.join(rssel_home(), "fs"), help="Destination directory (default: ./.rssel/fs)")
     sp_all.add_argument("--format", choices=["md", "txt", "json", "html"], default="md", help="File format for content (default: md)")
     sp_all.add_argument("--unread-only", action="store_true", help="Only export unread items")
@@ -3601,6 +4447,7 @@ def build_parser():
     # pick: fuzzy filter; outputs like list using show flags
     sp_pick = sub.add_parser("pick", help="Fuzzy-pick items (filters) and print them like list")
     sp_pick.add_argument("--group", "-g", help="Filter by group")
+    sp_pick.add_argument("--tier", help="Filter by feed tier(s) 1-5 (comma/space)")
     sp_pick.add_argument("--tags", help="Comma/space separated tag names; item must have ALL")
     sp_pick.add_argument("--unread-only", action="store_true", help="Only include unread items")
     sp_pick.add_argument("--read", dest="read_only", action="store_true", help="Only include read items")
@@ -3612,6 +4459,9 @@ def build_parser():
     sp_pick.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp_pick.add_argument("--date-field", choices=["published", "created"], default="published")
     sp_pick.add_argument("--query", "-q", help="Initial search query for fzf and DB filter")
+    # Grouping like list
+    sp_pick.add_argument("--group-by", choices=["date", "group", "tier", "tag", "source"], help="Group printed output (date/group/tier/tag/source)")
+    sp_pick.add_argument("--date-bucket", choices=["day", "week", "month"], default="day", help="Bucket for --group-by date")
     # Sorting options similar to list
     sp_pick.add_argument("--sort-id", action="store_true")
     sp_pick.add_argument("--sort-id-rev", action="store_true")
@@ -3623,13 +4473,21 @@ def build_parser():
     sp_pick.add_argument("--no-fzf", action="store_true", help="Print directly without fzf; same as list")
     sp_pick.add_argument("--multi", action="store_true", help="Allow selecting multiple items in fzf")
     # Show options (same as list)
+    sp_pick.add_argument("--grid", action="store_true", help="Align output as a grid (columns)")
+    sp_pick.add_argument("--grid-meta", help="In --grid mode, show selected metadata rows (comma/space list of: date,path,url,tags,source,snippet)")
     sp_pick.add_argument("--show-url", action="store_true")
     sp_pick.add_argument("--show-tags", action="store_true")
     sp_pick.add_argument("--show-path", action="store_true")
     sp_pick.add_argument("--show-date", action="store_true")
     sp_pick.add_argument("--show-snippet", action="store_true")
+    sp_pick.add_argument("--show-meta", action="store_true")
+    sp_pick.add_argument("--show-meta-data", action="store_true")
+    sp_pick.add_argument("--show-guid", action="store_true")
     sp_pick.add_argument("--show-source", action="store_true")
     sp_pick.add_argument("--color", action="store_true")
+    sp_pick.add_argument("--nocolor", action="store_true")
+    sp_pick.add_argument("--highlight", action="store_true", help="Mark items matching highlight word list with '!' (see highlight_words_file in config)")
+    sp_pick.add_argument("--highlight-only", action="store_true", help="Only show items that match the highlight word list")
     sp_pick.add_argument("--export", action="store_true", help="Export the filtered items to files")
     sp_pick.add_argument("--dest", help="Export destination directory (defaults to export_dir in config)")
     sp_pick.add_argument("--format", choices=["md", "txt", "json", "html"], help="Export format (defaults to export_format in config)")
@@ -3854,6 +4712,19 @@ def build_parser():
     sp_pd.add_argument("--vacuum", action="store_true")
     sp_pd.add_argument("--dry-run", action="store_true")
     sp_pd.set_defaults(func=lambda a: cmd_purge(argparse.Namespace(deleted=True, before=None, older_days=None, group=a.group, source=a.source, source_id=a.source_id, clean_tags=a.clean_tags, vacuum=a.vacuum, dry_run=a.dry_run)))
+
+    # stats: show DB statistics (optionally filtered)
+    sp_stats = sub.add_parser("stats", help="Show database statistics (optionally filtered by group/source/date)")
+    sp_stats.add_argument("--group", "-g", help="Filter by group(s)")
+    sp_stats.add_argument("--source", help="Filter by source (url or numeric id)")
+    sp_stats.add_argument("--since", help="Filter items by date/time >=")
+    sp_stats.add_argument("--until", help="Filter items by date/time < (exclusive)")
+    sp_stats.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
+    sp_stats.add_argument("--date-field", choices=["published", "created"], default="published")
+    sp_stats.add_argument("--top", type=int, default=10, help="Top N for tags/sources (default: 10)")
+    sp_stats.add_argument("--color", action="store_true", help="Colorize output")
+    sp_stats.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output")
+    sp_stats.set_defaults(func=cmd_stats)
 
     return p
 

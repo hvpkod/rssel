@@ -41,8 +41,8 @@ Sources (JSON)
   ```json
   {
     "sources": [
-      { "title": "Simon Sinek", "url": "https://simonsinek.com/feed/", "groups": ["ideas","tech"] },
-      { "title": "This Week in Rust", "url": "https://this-week-in-rust.org/rss.xml", "groups": ["tech"] }
+      { "title": "Simon Sinek", "url": "https://simonsinek.com/feed/", "groups": ["ideas","tech"], "tier": 2 },
+      { "title": "This Week in Rust", "url": "https://this-week-in-rust.org/rss.xml", "groups": ["tech"], "tier": 1 }
     ]
   }
   ```
@@ -55,6 +55,7 @@ Key Commands
 - `rssel sync` — fetch + auto‑tag + export
   - `--group Gs` `--dest DIR` `--format md|txt|json|html` `--clean` `--no-auto-tags` `--max-tags K` `--include-domain`
 - `rssel fetch [--group Gs]` — fetch only
+  - Filter by tier: `--tier 1,2,3`
 - `rssel list` — filter and print items
   - Filters: `--group Gs` `--tags T1,T2` `--limit N` `--unread-only|--read|--star` `--query Q`
   - Dates: `--since D` `--until D` `--on D` `--date-field published|created`
@@ -103,6 +104,34 @@ Simple Aliases (fast flows)
 - Remove source by id/url: `rssel rm --id ID --yes [--vacuum]`  (alias of `source rm`)
 - Soft-delete items: `rssel trash id <id> [--undo|--force]`, `rssel trash source --id ID [--undo|--force]` (alias of `delete`)
 - Purge deleted: `rssel pd [--group Gs] [--source URL|ID|--source-id ID] [--clean-tags] [--vacuum] [--dry-run]` (alias of `purge --deleted`)
+Step‑by‑Step: Archive, Delete, Purge
+
+Find sources and IDs
+- DB summary: `rssel list --sources --sort-id` (shows ID, items, last date, [archived])
+- Config view (with DB info): `rssel sources --with-db`
+
+Archive a source (stop fetching)
+- Archive by ID: `rssel a --id 6`
+- Undo (make active): `rssel a --id 6 --undo`
+- Also mark existing items deleted (starred protected): `rssel a --id 6 --delete-items`
+
+Soft‑delete (trash) items
+- One item: `rssel trash id 123`
+- By source: `rssel trash source --id 6`
+- Include starred too: add `--force`
+- Undo (restore): add `--undo`
+
+Purge deleted items (remove permanently)
+- Simple: `rssel pd --source-id 6 --clean-tags --vacuum`
+  - Scope by group: `rssel pd --group news`
+  - Global purge: `rssel pd --clean-tags --vacuum`
+- Advanced: `rssel purge --deleted [--group Gs] [--source URL|ID|--source-id ID] [--clean-tags] [--vacuum] [--dry-run]`
+
+Remove a source row (and its items)
+- Preview (dry run): `rssel rm --id 6` (prints what will be removed)
+- Confirm: `rssel rm --id 6 --yes --vacuum`
+- Optional: remove from config as well by editing `./.rssel/sources.json`
+
 Highlighting
 - Edit `./.rssel/highlights.txt` and add words/phrases (UTF‑8, `#` for comments).
 - List with `--highlight` to mark matches with `!`, or `--only-highlight` to filter.
@@ -123,3 +152,21 @@ Notes
 - Pager: uses `$RSSEL_PAGER`/`$PAGER`, falls back to `less`/`more`.
 - File tree: `./.rssel/fs/<group>/<id>-<slug>.<ext>` with a small metadata header.
  
+Cold Storage (tar.gz)
+- Archive filtered items to a tar.gz (default) or tar with the same filters as `list`:
+  - Basic: `rssel cold --group news`
+  - Custom name: `rssel cold -o ./backup/news-archive` (writes `news-archive.gz`)
+  - Plain tar: `rssel cold -o ./backup/news-archive.tar --no-gzip`
+  - Format inside tar: `--format md|txt|json|html` (default: md)
+- Filters supported: `--group`, `--tags`, `--source URL|ID`, `--limit`, `--unread-only|--read|--star`, `--new`, `--since|--until|--on` with `--date-field`, `--query`, `--highlight-only` (with `--highlight`)
+- Every archive includes `MANIFEST.json` with metadata: `generated_at`, `count`, `format`, and per‑item entries (id, group, title, link, published_ts/date, tags, path).
+
+Stats
+- Show database statistics (optionally filtered by group/source/date):
+  - Basic: `rssel stats`
+  - By group: `rssel stats --group news`
+  - By source: `rssel stats --source 6`
+  - Date range: `rssel stats --since 2025-10-01 --until 2025-10-18 --date-field created`
+  - Color: `rssel stats --color` (use `--nocolor` to force plain)
+  - Top lists: `rssel stats --top 20`
+- Output includes: feed totals (active/archived), item totals (alive/unread/starred/deleted), last item date, items in the `new_hours` window, per‑group counts, top tags, and top sources.
