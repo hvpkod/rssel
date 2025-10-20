@@ -26,6 +26,30 @@ from urllib.parse import urlparse
 
 APP_NAME = "rssel"
 
+# Nicely structured help epilog shown in `--help`
+HELP_EPILOG = (
+    "Aliases\n"
+    "  l=list, s=sync, p=pick, v=view, o=open, m=mark, read=view\n\n"
+    "Short flags\n"
+    "  -g/--group, -t/--tier, -n/--limit, -c/--color\n\n"
+    "Short item codes\n"
+    "  Many commands accept base36 item codes (e.g., 14018 => 'ate').\n"
+    "  Show codes in lists with --show-code or set display_show_code=true in config.\n\n"
+    "Dates\n"
+    "  Use --since/--until with 'YYYY-MM-DD[ HH:MM]' or --on with 'today'/'yesterday'.\n"
+    "  Switch date field: --date-field published|created.\n\n"
+    "Purge\n"
+    "  purge --deleted [--group Gs] [--source URL|ID|--source-id ID] [--before D|--older-days N]\n"
+    "        [--clean-tags] [--vacuum] [--dry-run]\n\n"
+    "Examples\n"
+    "  l -g news --on today --group-by date --date-bucket day\n"
+    "  s -g tech -t 1 --write-file\n"
+    "  v 3r2t6              # view by short code\n"
+    "  v --next -g news     # next unread in group\n"
+    "  p -g news --grid --grid-meta date,url,tags\n"
+    "\nRun 'rssel <command> --help' for full options of each command.\n"
+)
+
 
 # ---------------- Simple ANSI color helpers ---------------- #
 
@@ -35,6 +59,39 @@ def _style(text: str, *codes) -> str:
 
 def _maybe(text: str, enable: bool, *codes) -> str:
     return _style(text, *codes) if enable else text
+
+
+# ---------------- ID short-code helpers ---------------- #
+
+def _id_to_code(n: int) -> str:
+    try:
+        if n < 0:
+            return f"-{-_id_to_code(-n)}"
+        digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+        if n < 36:
+            return digits[n]
+        out = []
+        while n:
+            n, r = divmod(n, 36)
+            out.append(digits[r])
+        return "".join(reversed(out))
+    except Exception:
+        return str(n)
+
+def _parse_item_id_token(tok: str) -> int | None:
+    if tok is None:
+        return None
+    s = str(tok).strip()
+    if not s:
+        return None
+    try:
+        # Decimal fast path
+        if s.isdigit():
+            return int(s)
+        # Base36 (letters allowed)
+        return int(s, 36)
+    except Exception:
+        return None
 
 
 def normalize_part(part: str | None) -> str | None:
@@ -90,6 +147,10 @@ def full_config_template() -> str:
         "sync_auto_tags = \"true\"\n"
         "sync_max_tags = \"5\"\n"
         "sync_include_domain = \"false\"\n\n"
+        "# Sync export (write files)\n"
+        "# If false, sync will fetch and tag but skip writing files.\n"
+        "# Override per-run with --write-file.\n"
+        "sync_write_files = \"true\"\n\n"
         "# Display defaults (\"true\"/\"false\")\n"
         "display_color = \"false\"\n"
         "display_show_url = \"false\"\n"
@@ -97,6 +158,11 @@ def full_config_template() -> str:
         "display_show_path = \"false\"\n"
         "display_show_date = \"false\"\n"
         "display_show_snippet = \"false\"\n"
+        "display_show_code = \"true\"\n"
+        "display_grid = \"false\"\n"
+        "display_json = \"false\"\n"
+        "display_highlight = \"false\"\n"
+        "display_highlight_only = \"false\"\n"
         "display_snippet_len = \"240\"\n\n"
         "# Internal file-tree export (list/pick/pick-tags --export and sync)\n"
         "export_dir = \"./.rssel/fs\"\n"
@@ -191,6 +257,7 @@ def resolve_display_opts(args) -> dict:
     if getattr(args, "nocolor", False):
         color_enabled = False
     show_tags = False if getattr(args, "no_show_tags", False) else opt("show_tags")
+    show_code = bool(getattr(args, "show_code", False)) or cfg_flag(cfg, "display_show_code", True)
     return {
         "show_url": opt("show_url"),
         "show_tags": show_tags,
@@ -200,6 +267,7 @@ def resolve_display_opts(args) -> dict:
         "show_source": opt("show_source"),
         "show_meta": getattr(args, "show_meta", False) or getattr(args, "show_meta_data", False),
         "show_guid": getattr(args, "show_guid", False),
+        "show_code": show_code,
         "color": color_enabled,
         "order": order,
         "snippet_len": snippet_len,
@@ -274,18 +342,11 @@ def detect_clipboard_cmd(config: dict) -> list[str] | None:
 
 
 def parse_sources_file(text: str) -> list[dict]:
-    """Parse sources file supporting two forms:
-    1) Legacy:
-       [groups]\n
-       group = ["url1","url2"]
-       -> each url belongs to one or more groups
-    2) New blocks:
-       [[source]]\n
-       title = "Name"\n
-       url = "https://..."\n
-       groups = ["g1","g2"]
-
-    Returns list of dicts: {url, title, groups: [..]}
+    """Parse sources file (JSON only).
+    Expected structure:
+      { "sources": [ {"title": str|None, "url": str, "groups": [str], "tier": 1..5?}, ... ] }
+    Returns a list of dicts: {url, title, groups: [..], tier}
+    Invalid or missing fields are sanitized; non-list or empty input yields [].
     """
     text = text.strip()
     if not text:
@@ -384,7 +445,7 @@ def init_db(conn: sqlite3.Connection):
             grp TEXT NOT NULL,
             title TEXT,
             favorite INTEGER DEFAULT 0,
-            tier TEXT DEFAULT 'normal',
+            tier TEXT DEFAULT '3',
             last_fetch_ts INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS feed_groups (
@@ -458,7 +519,7 @@ def init_db(conn: sqlite3.Connection):
             pass
     if "tier" not in fcols:
         try:
-            cur.execute("ALTER TABLE feeds ADD COLUMN tier TEXT DEFAULT 'normal'")
+            cur.execute("ALTER TABLE feeds ADD COLUMN tier TEXT DEFAULT '3'")
         except Exception:
             pass
     if "last_fetch_ts" not in fcols:
@@ -467,6 +528,12 @@ def init_db(conn: sqlite3.Connection):
         except Exception:
             pass
     conn.commit()
+    # Normalize any non-numeric tier values to '3' for compatibility with filters
+    try:
+        cur.execute("UPDATE feeds SET tier = '3' WHERE TRIM(COALESCE(tier,'')) NOT IN ('1','2','3','4','5')")
+        conn.commit()
+    except Exception:
+        pass
     # Helpful indexes for common queries
     conn.executescript(
         """
@@ -991,13 +1058,6 @@ def _print_meta_block(conn: sqlite3.Connection, item: dict, dt: str, opts: dict)
                 kv("uid", uid_val, 35, 35)
             if guid_val:
                 kv("guid", guid_val, 35, 35)
-        elif field == "meta" and (opts.get("show_meta") or opts.get("show_meta_data")):
-            uid_val = (item or {}).get("uid") or ""
-            guid_val = (item or {}).get("guid") or ""
-            if uid_val:
-                kv("uid", uid_val, 35, 35)
-            if guid_val:
-                kv("guid", guid_val, 35, 35)
 
 
 def cmd_list(args):
@@ -1007,6 +1067,16 @@ def cmd_list(args):
     cur = conn.cursor()
     # Resolve display options early so sources summary can use color
     opts = resolve_display_opts(args)
+    cfg = read_config()
+    # Default highlight flags from config if not set on CLI
+    if not getattr(args, "highlight", False) and not getattr(args, "highlight_only", False):
+        if cfg_flag(cfg, "display_highlight_only", False):
+            setattr(args, "highlight_only", True)
+        elif cfg_flag(cfg, "display_highlight", False):
+            setattr(args, "highlight", True)
+    # Default JSON from config if not provided on CLI
+    if not getattr(args, "json", False) and cfg_flag(cfg, "display_json", False):
+        setattr(args, "json", True)
     # If --sources or --list-sources, list sources summary
     if getattr(args, "sources", False) or getattr(args, "list_sources", False):
         # Sorting for the summary
@@ -1359,7 +1429,7 @@ def cmd_list(args):
     # Pre-prepare a cursor for fetching groups per feed
     cur_groups = conn.cursor()
     # Optional grid layout
-    grid = getattr(args, "grid", False)
+    grid = getattr(args, "grid", False) or cfg_flag(cfg, "display_grid", False)
     def _ansi_strip(s: str) -> str:
         return re.sub(r"\x1b\[[0-9;]*m", "", s)
     def _pad(s: str, w: int, right: bool = True) -> str:
@@ -1424,7 +1494,10 @@ def cmd_list(args):
         if not groups:
             groups = [grp] if grp else []
         grp_label = "[" + ",".join(groups) + "]"
+        code = _id_to_code(int(iid))
         id_s = _maybe(str(iid), opts["color"], 2)
+        if opts.get("show_code"):
+            id_s = f"{id_s}/" + _maybe(code, opts["color"], 90)
         mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
         hmark_s = _maybe(hmark, opts["color"] and hmark == "!", 31, 1) if hmark.strip() else hmark
         marks = mark_s + hmark_s
@@ -1432,7 +1505,11 @@ def cmd_list(args):
         title_s = _maybe(title or '', opts["color"], 35, 1) if is_hl else _maybe(title or '', opts["color"], 1)
         dt_s = _maybe(dt, opts["color"], 2)
         if grid:
-            print(_pad(id_s, col_id, right=False), _pad(marks, col_marks), _truncate(grp_s, col_groups), title_s)
+            id_lbl = id_s
+            if opts.get("show_code") and len(_ansi_strip(id_s)) < col_id:
+                # ensure padding accounts for added code
+                pass
+            print(_pad(id_lbl, col_id, right=False), _pad(marks, col_marks), _truncate(grp_s, col_groups), title_s)
             label_w = 10
             item = None
             for key in meta_rows:
@@ -1492,7 +1569,11 @@ def cmd_list(args):
             if opts["show_url"] or opts["show_tags"] or opts["show_path"] or opts["show_snippet"] or opts["show_date"]:
                 print(f"{id_s} {marks} {grp_s} {title_s}")
             else:
-                id_p = _maybe(f"{iid:6d}", opts["color"], 2)
+                base_id = f"{iid:6d}"
+                id_p = _maybe(base_id, opts["color"], 2)
+                if opts.get("show_code"):
+                    code = _id_to_code(int(iid))
+                    id_p = f"{id_p}/" + _maybe(code, opts["color"], 90)
                 grp_p = _maybe(grp_label, opts["color"], 36)
                 print(f"{id_p} {marks} {grp_p} {dt_s}  {title_s}")
             shown_count += 1
@@ -1832,6 +1913,15 @@ def cmd_export(args):
     init_db(conn)
     cfg = read_config()
     dest = args.to
+    # Parse ids (support decimal or base36)
+    ids: list[int] = []
+    for tok in args.ids:
+        v = _parse_item_id_token(tok)
+        if v is not None:
+            ids.append(v)
+    if not ids:
+        print("No valid item id(s).", file=sys.stderr)
+        return 1
     if dest in ("stdout", "editor", "clipboard") and len(args.ids) > 1:
         print("Export to stdout/editor/clipboard supports one id at a time. Use --to file for multiple.", file=sys.stderr)
         return 1
@@ -1841,17 +1931,17 @@ def cmd_export(args):
         fmt = args.format or cfg.get("external_export_format") or "md"
         rows = []
         cur = conn.cursor()
-        placeholders = ",".join(["?"] * len(args.ids))
+        placeholders = ",".join(["?"] * len(ids))
         cur.execute(
             f"SELECT items.id, items.published_ts, items.read, feeds.grp, items.title FROM items JOIN feeds ON items.feed_url = feeds.url WHERE items.id IN ({placeholders})",
-            list(args.ids),
+            list(ids),
         )
         rows = cur.fetchall()
         n = export_rows(conn, rows, out_dir, fmt)
         print(f"Exported {n} items to {out_dir} (format: {fmt})")
         return 0
     else:
-        iid = args.ids[0]
+        iid = ids[0]
         item = get_item(conn, iid)
         if not item:
             print(f"No item with id {iid}", file=sys.stderr)
@@ -1880,13 +1970,17 @@ def cmd_mark(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
+    iid = _parse_item_id_token(args.id)
+    if iid is None:
+        print("Invalid id", file=sys.stderr)
+        return 1
     val = 0 if args.state == "unread" else 1
-    cur.execute("UPDATE items SET read = ? WHERE id = ?", (val, args.id))
+    cur.execute("UPDATE items SET read = ? WHERE id = ?", (val, iid))
     if cur.rowcount == 0:
         print(f"No item with id {args.id}", file=sys.stderr)
         return 1
     conn.commit()
-    print(f"Marked {args.id} as {args.state}")
+    print(f"Marked {iid} as {args.state}")
     return 0
 
 
@@ -2169,15 +2263,58 @@ def next_unread_item(conn: sqlite3.Connection, group: str | None):
 def cmd_view(args):
     conn = db_conn()
     init_db(conn)
-    item_id = args.id
+    # Resolve id: allow decimal or base36
+    item_id = _parse_item_id_token(args.id) if args.id is not None else None
     if item_id is None and args.next:
         item_id = next_unread_item(conn, args.group)
         if item_id is None:
             print("No unread items.")
             return 0
     if item_id is None:
-        print("Provide an id or --next.", file=sys.stderr)
-        return 1
+        # Fallback to interactive picker if available
+        fzf = detect_fzf()
+        cur = conn.cursor()
+        where = ["items.deleted = 0"]
+        params: list = []
+        if getattr(args, "group", None):
+            where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
+            params.append(args.group)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT items.id, items.published_ts, items.read, feeds.grp, items.title
+            FROM items JOIN feeds ON items.feed_url = feeds.url
+            {where_sql}
+            ORDER BY items.published_ts DESC, items.id DESC
+            LIMIT 1000
+        """
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        if not rows:
+            print("No items to select.")
+            return 0
+        if fzf:
+            lines = []
+            for (iid, ts, read, grp, title) in rows:
+                mark = (" " if read else "*") + " "
+                dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
+                code = _id_to_code(int(iid))
+                lines.append(f"{iid}\t{code}\t{mark}\t[{grp}]\t{dt}\t{title or ''}")
+            data = "\n".join(lines)
+            cmd = fzf + ["--with-nth", "3..6", "--delimiter", "\t", "--prompt", "view>"]
+            # Preview with our built-in renderer
+            py = shutil.which('python3') or 'python3'
+            cmd += ["--preview", f"{py} {os.path.abspath(__file__)} preview --id {{1}}", "--preview-window", "right:60%:wrap"]
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                out, _ = proc.communicate(input=data.encode("utf-8", errors="replace"))
+                if proc.returncode == 0 and out:
+                    line = out.decode("utf-8", errors="replace").strip()
+                    item_id = parse_selected_id(line)
+            except FileNotFoundError:
+                item_id = None
+        if item_id is None:
+            print("Provide an id or use the picker (install fzf).", file=sys.stderr)
+            return 1
     item = get_item(conn, item_id)
     if not item:
         print(f"No item with id {item_id}", file=sys.stderr)
@@ -2235,7 +2372,12 @@ def cmd_open(args):
         return 1
     opened = 0
     missing = []
-    for iid in args.ids:
+    ids: list[int] = []
+    for tok in args.ids:
+        v = _parse_item_id_token(tok)
+        if v is not None:
+            ids.append(v)
+    for iid in ids:
         item = get_item(conn, iid)
         if not item:
             missing.append(iid)
@@ -2251,7 +2393,7 @@ def cmd_open(args):
             print(f"Failed to open id {iid}: {e}", file=sys.stderr)
     if args.mark_read and opened:
         cur = conn.cursor()
-        cur.executemany("UPDATE items SET read = 1 WHERE id = ?", [(iid,) for iid in args.ids])
+        cur.executemany("UPDATE items SET read = 1 WHERE id = ?", [(iid,) for iid in ids])
         conn.commit()
     if missing:
         print("Missing ids: " + ", ".join(str(i) for i in missing), file=sys.stderr)
@@ -2261,7 +2403,11 @@ def cmd_open(args):
 def cmd_edit(args):
     conn = db_conn()
     init_db(conn)
-    item = get_item(conn, args.id)
+    iid = _parse_item_id_token(args.id)
+    if iid is None:
+        print("Invalid id", file=sys.stderr)
+        return 1
+    item = get_item(conn, iid)
     if not item:
         print(f"No item with id {args.id}", file=sys.stderr)
         return 1
@@ -2292,11 +2438,15 @@ def cmd_archive_id(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
+    iid = _parse_item_id_token(args.id)
+    if iid is None:
+        print("Invalid id", file=sys.stderr)
+        return 1
     if args.undo:
-        cur.execute("UPDATE items SET deleted = 0 WHERE id = ?", (args.id,))
+        cur.execute("UPDATE items SET deleted = 0 WHERE id = ?", (iid,))
     else:
         # Refuse to archive starred items
-        cur.execute("SELECT starred FROM items WHERE id = ?", (args.id,))
+        cur.execute("SELECT starred FROM items WHERE id = ?", (iid,))
         row = cur.fetchone()
         if not row:
             print(f"No item {args.id}")
@@ -2304,9 +2454,9 @@ def cmd_archive_id(args):
         if row[0]:
             print("Cannot archive a starred item. Unstar it first.", file=sys.stderr)
             return 1
-        cur.execute("UPDATE items SET deleted = 1 WHERE id = ?", (args.id,))
+        cur.execute("UPDATE items SET deleted = 1 WHERE id = ?", (iid,))
     conn.commit()
-    print(("Unarchived" if args.undo else "Archived") + f" item {args.id}")
+    print(("Unarchived" if args.undo else "Archived") + f" item {iid}")
     return 0
 
 
@@ -2368,14 +2518,18 @@ def cmd_delete_id(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
+    iid = _parse_item_id_token(args.id)
+    if iid is None:
+        print("Invalid id", file=sys.stderr)
+        return 1
     if getattr(args, "undo", False):
-        cur.execute("UPDATE items SET deleted = 0 WHERE id = ?", (args.id,))
+        cur.execute("UPDATE items SET deleted = 0 WHERE id = ?", (iid,))
         conn.commit()
-        print(f"Undeleted item {args.id}")
+        print(f"Undeleted item {iid}")
         return 0
     if not getattr(args, "force", False):
         # Protect starred by default
-        cur.execute("SELECT starred FROM items WHERE id = ?", (args.id,))
+        cur.execute("SELECT starred FROM items WHERE id = ?", (iid,))
         row = cur.fetchone()
         if not row:
             print(f"No item {args.id}")
@@ -2383,9 +2537,9 @@ def cmd_delete_id(args):
         if row[0]:
             print("Refusing to delete a starred item (use --force)", file=sys.stderr)
             return 1
-    cur.execute("UPDATE items SET deleted = 1 WHERE id = ?", (args.id,))
+    cur.execute("UPDATE items SET deleted = 1 WHERE id = ?", (iid,))
     conn.commit()
-    print(f"Deleted item {args.id} (soft)")
+    print(f"Deleted item {iid} (soft)")
     return 0
 
 
@@ -2530,9 +2684,14 @@ def cmd_star_add(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
-    cur.executemany("UPDATE items SET starred = 1 WHERE id = ?", [(i,) for i in args.ids])
+    ids: list[int] = []
+    for tok in args.ids:
+        v = _parse_item_id_token(tok)
+        if v is not None:
+            ids.append(v)
+    cur.executemany("UPDATE items SET starred = 1 WHERE id = ?", [(i,) for i in ids])
     conn.commit()
-    print(f"Starred {len(args.ids)} item(s)")
+    print(f"Starred {len(ids)} item(s)")
     return 0
 
 
@@ -2540,9 +2699,14 @@ def cmd_star_remove(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
-    cur.executemany("UPDATE items SET starred = 0 WHERE id = ?", [(i,) for i in args.ids])
+    ids: list[int] = []
+    for tok in args.ids:
+        v = _parse_item_id_token(tok)
+        if v is not None:
+            ids.append(v)
+    cur.executemany("UPDATE items SET starred = 0 WHERE id = ?", [(i,) for i in ids])
     conn.commit()
-    print(f"Unstarred {len(args.ids)} item(s)")
+    print(f"Unstarred {len(ids)} item(s)")
     return 0
 
 
@@ -2561,7 +2725,12 @@ def cmd_copy(args):
     part = normalize_part(part_raw)
     pieces: list[str] = []
     missing: list[int] = []
-    for iid in args.ids:
+    ids: list[int] = []
+    for tok in args.ids:
+        v = _parse_item_id_token(tok)
+        if v is not None:
+            ids.append(v)
+    for iid in ids:
         item = get_item(conn, iid)
         if not item:
             missing.append(iid)
@@ -3012,28 +3181,32 @@ def cmd_sync(args):
             processed += 1
         print(c("Auto-tagged ", 2) + c(str(processed), 32 if processed > 0 else 33, 1) + c(f" items (max={max_tags}, include_domain={'yes' if include_domain else 'no'})", 2))
 
-    # Export
-    dest = os.path.abspath(args.dest)
-    ensure_clean_dir(dest, args.clean)
-    groups_done: set[str] = set()
-    count = 0
-    allowed: set[str] | None = set(feed_urls) if (getattr(args, "id", None) is not None or getattr(args, "source", None)) else None
-    for item in iter_items(conn, args.group, args.unread_only, args.limit):
-        if allowed is not None:
-            # Load feed_url for this item to filter; get_item returns feed_url
-            it = get_item(conn, item["id"]) if "feed_url" not in item else None
-            furl = (item.get("feed_url") if isinstance(item, dict) else None) or ((it or {}).get("feed_url") if it else None)
-            if furl not in allowed:
-                continue
-        grp = item.get("group") or "ungrouped"
-        gdir = os.path.join(dest, grp)
-        if grp not in groups_done:
-            os.makedirs(gdir, exist_ok=True)
-            groups_done.add(grp)
-        tags = get_item_tag_names(conn, item["id"]) if args.format in ("md", "txt", "json", "html") else []
-        write_item_file(gdir, item, args.format, tags)
-        count += 1
-    print(c("Exported ", 2) + c(str(count), 36) + c(" items to ", 2) + c(dest, 32) + c(f" (format: {args.format})", 2))
+    # Export step (optional based on config)
+    cfg_write = cfg_flag(cfg, "sync_write_files", True)
+    if cfg_write or getattr(args, "write_file", False):
+        dest = os.path.abspath(args.dest)
+        ensure_clean_dir(dest, args.clean)
+        groups_done: set[str] = set()
+        count = 0
+        allowed: set[str] | None = set(feed_urls) if (getattr(args, "id", None) is not None or getattr(args, "source", None)) else None
+        for item in iter_items(conn, args.group, args.unread_only, args.limit):
+            if allowed is not None:
+                # Load feed_url for this item to filter; get_item returns feed_url
+                it = get_item(conn, item["id"]) if "feed_url" not in item else None
+                furl = (item.get("feed_url") if isinstance(item, dict) else None) or ((it or {}).get("feed_url") if it else None)
+                if furl not in allowed:
+                    continue
+            grp = item.get("group") or "ungrouped"
+            gdir = os.path.join(dest, grp)
+            if grp not in groups_done:
+                os.makedirs(gdir, exist_ok=True)
+                groups_done.add(grp)
+            tags = get_item_tag_names(conn, item["id"]) if args.format in ("md", "txt", "json", "html") else []
+            write_item_file(gdir, item, args.format, tags)
+            count += 1
+        print(c("Exported ", 2) + c(str(count), 36) + c(" items to ", 2) + c(dest, 32) + c(f" (format: {args.format})", 2))
+    else:
+        print(c("Export step disabled by config (sync_write_files=false). Use --write-file to force.", 33))
     return 0
 
 
@@ -3360,7 +3533,11 @@ def cmd_tags_items(args):
             title_s = _maybe(title or '', opts["color"], 1)
             print(f"{id_s} {mark_s} {grp_s} {title_s}")
         else:
-            id_s = _maybe(f"{iid:6d}", opts["color"], 2)
+            code = _id_to_code(int(iid))
+            base_id = f"{iid:6d}"
+            id_s = _maybe(base_id, opts["color"], 2)
+            if opts.get("show_code"):
+                id_s = f"{id_s}/" + _maybe(code, opts["color"], 90)
             mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
             grp_s = f"[{_maybe(grp, opts["color"], 36)}]"
             dt_s = _maybe(dt, opts["color"], 2)
@@ -3774,24 +3951,24 @@ def cmd_pick_tags(args):
         fmt = args.format or cfg.get("export_format") or "md"
         n = export_rows(conn, rows_to_print, os.path.abspath(dest), fmt)
         print(f"Exported {n} items to {os.path.abspath(dest)} (format: {fmt})")
-    # Optional export
-    if getattr(args, "export", False) and rows_to_print:
-        cfg = read_config()
-        dest = args.dest or cfg.get("export_dir") or os.path.join(rssel_home(), "fs")
-        fmt = args.format or cfg.get("export_format") or "md"
-        n = export_rows(conn, rows_to_print, os.path.abspath(dest), fmt)
-        print(f"Exported {n} items to {os.path.abspath(dest)} (format: {fmt})")
     for (iid, ts, read, grp, title, *rest) in rows_to_print:
         mark = " " if read else "*"
         dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
         if opts["show_url"] or opts["show_tags"] or opts["show_path"] or opts["show_snippet"] or opts["show_date"]:
+            code = _id_to_code(int(iid))
             id_s = _maybe(str(iid), opts["color"], 2)
+            if opts.get("show_code"):
+                id_s = f"{id_s}/" + _maybe(code, opts["color"], 90)
             mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
             grp_s = f"[{_maybe(grp, opts["color"], 36)}]"
             title_s = _maybe(title or '', opts["color"], 1)
             print(f"{id_s} {mark_s} {grp_s} {title_s}")
         else:
-            id_s = _maybe(f"{iid:6d}", opts["color"], 2)
+            base_id = f"{iid:6d}"
+            code = _id_to_code(int(iid))
+            id_s = _maybe(base_id, opts["color"], 2)
+            if opts.get("show_code"):
+                id_s = f"{id_s}/" + _maybe(code, opts["color"], 90)
             mark_s = _maybe(mark, opts["color"] and mark == "*", 33, 1) if mark.strip() else mark
             grp_s = f"[{_maybe(grp, opts["color"], 36)}]"
             dt_s = _maybe(dt, opts["color"], 2)
@@ -4025,8 +4202,14 @@ def cmd_pick(args):
     rows_to_print = rows
     # Print like list: reuse list’s display helpers and grouping options (subset)
     opts = resolve_display_opts(args)
-    # Grid helpers reused
-    grid = getattr(args, "grid", False)
+    # Grid helpers reused (with config default)
+    grid = getattr(args, "grid", False) or cfg_flag(read_config(), "display_grid", False)
+    # Default highlight flags from config if not set on CLI
+    if not getattr(args, "highlight", False) and not getattr(args, "highlight_only", False):
+        if cfg_flag(read_config(), "display_highlight_only", False):
+            setattr(args, "highlight_only", True)
+        elif cfg_flag(read_config(), "display_highlight", False):
+            setattr(args, "highlight", True)
     def _ansi_strip(s: str) -> str:
         return re.sub(r"\x1b\[[0-9;]*m", "", s)
     def _pad(s: str, w: int, right: bool = True) -> str:
@@ -4245,7 +4428,12 @@ def cmd_pick(args):
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog=APP_NAME, description="Lightweight, self-contained CLI RSS reader")
+    p = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Lightweight, self‑contained CLI RSS reader",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=HELP_EPILOG,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("init", help="Create local config, sources, and DB")
@@ -4268,7 +4456,15 @@ def build_parser():
     sp.add_argument("--nocolor", action="store_true", help="Force-disable ANSI colors in output")
     sp.set_defaults(func=cmd_fetch)
 
-    sp = sub.add_parser("list", help="List cached items")
+    LIST_DESC = (
+        "List cached items.\n\n"
+        "Filters: --group, --tags, --tier, --since/--until/--on, --new, --query.\n"
+        "Grouping: --group-by date|group|tier|tag|source (with --date-bucket).\n"
+        "Sorting: --sort-*.  Display: --grid, --grid-meta, --color, --show-*.\n"
+        "Export: --export [--dest --format]. JSON: --json.\n"
+        "Show short codes: --show-code (or config display_show_code=true).\n"
+    )
+    sp = sub.add_parser("list", help="List cached items", aliases=["l"], formatter_class=argparse.RawTextHelpFormatter, description=LIST_DESC)
     sp.add_argument("--group", "-g", help="Filter by group")
     sp.add_argument("--tier", help="Filter by feed tier(s) 1-5 (comma/space)")
     sp.add_argument("--group-by", choices=["date", "group", "tier", "tag", "source"], help="Group printed output (date/group/tier/tag/source)")
@@ -4282,6 +4478,8 @@ def build_parser():
     sp.add_argument("--query", "-q", help="Search in title/summary")
     sp.add_argument("--since", help="Filter by date/time >= (e.g., 2025-10-16 or 2025-10-16 12:00 or 'today')")
     sp.add_argument("--until", help="Filter by date/time < (exclusive)")
+    sp.add_argument("--from", dest="since", help="Alias for --since")
+    sp.add_argument("--to", dest="until", help="Alias for --until")
     sp.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
     sp.add_argument("--source", help="Filter by a source (url or numeric id)")
@@ -4304,6 +4502,7 @@ def build_parser():
     sp.add_argument("--grid", action="store_true", help="Align output as a grid (columns)")
     sp.add_argument("--grid-meta", help="In --grid mode, show selected metadata rows (comma/space list of: date,path,url,tags,source,snippet)")
     sp.add_argument("--json", action="store_true", help="Output items as a JSON array (includes base fields + url/path/tags/source/snippet)")
+    sp.add_argument("--show-code", action="store_true", help="Show short base36 code next to numeric id")
     sp.add_argument("--no-show-tags", dest="no_show_tags", action="store_true", help="Force-hide tags even if enabled in config")
     sp.add_argument("--show-url", action="store_true", help="Show URL as an indented metadata line")
     sp.add_argument("--show-tags", action="store_true", help="Show tags as an indented metadata line")
@@ -4321,7 +4520,7 @@ def build_parser():
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("export", help="Export one or many items")
-    sp.add_argument("ids", type=int, nargs="+", help="Item ID(s)")
+    sp.add_argument("ids", type=str, nargs="+", help="Item ID(s) (decimal or base36 code)")
     sp.add_argument("--to", choices=["stdout", "editor", "clipboard", "file"], default="stdout", help="Destination: stdout/editor/clipboard or file(s)")
     sp.add_argument("--part", choices=["title", "summary", "content", "link", "url"], help="Field for stdout/editor/clipboard (default: content)")
     sp.add_argument("--plain", action="store_true", help="Convert HTML to plain text for content/summary (stdout/editor/clipboard)")
@@ -4329,13 +4528,16 @@ def build_parser():
     sp.add_argument("--format", choices=["md", "txt", "json", "html"], help="File format for --to file (defaults to external_export_format in config)")
     sp.set_defaults(func=cmd_export)
 
-    sp = sub.add_parser("mark", help="Mark an item read or unread")
-    sp.add_argument("id", type=int)
+    sp = sub.add_parser("mark", help="Mark an item read or unread", aliases=["m"]) 
+    sp.add_argument("id", type=str)
     sp.add_argument("state", choices=["read", "unread"]) 
     sp.set_defaults(func=cmd_mark)
 
-    sp = sub.add_parser("view", help="Read an article in a pager")
-    sp.add_argument("id", type=int, nargs="?", help="Item ID")
+    # 'm' is a short alias of 'mark'
+    # Alias handled via main parser (m)
+
+    sp = sub.add_parser("view", help="Read an article in a pager", aliases=["v", "read"]) 
+    sp.add_argument("id", type=str, nargs="?", help="Item ID (decimal or base36)")
     sp.add_argument("--next", action="store_true", help="Open next unread item")
     sp.add_argument("--group", "-g", help="Restrict --next to a group")
     sp.add_argument("--raw", action="store_true", help="Show raw HTML instead of plain text")
@@ -4344,44 +4546,27 @@ def build_parser():
     sp.set_defaults(func=cmd_view)
 
     # 'read' is an alias of 'view'
-    sp_read = sub.add_parser("read", help="Alias for 'view'")
-    sp_read.add_argument("id", type=int, nargs="?", help="Item ID")
-    sp_read.add_argument("--next", action="store_true", help="Open next unread item")
-    sp_read.add_argument("--group", "-g", help="Restrict --next to a group")
-    sp_read.add_argument("--raw", action="store_true", help="Show raw HTML instead of plain text")
-    sp_read.add_argument("--mark-read", action="store_true", help="(Legacy) Mark item as read after viewing (default behavior)")
-    sp_read.add_argument("--no-mark-read", action="store_true", help="Do not mark item as read after viewing")
-    sp_read.set_defaults(func=cmd_view)
+    # Alias handled via main parser (read)
 
     # 'v' is a short alias of 'view'
-    sp_v = sub.add_parser("v", help="Alias for 'view'")
-    sp_v.add_argument("id", type=int, nargs="?", help="Item ID")
-    sp_v.add_argument("--next", action="store_true", help="Open next unread item")
-    sp_v.add_argument("--group", "-g", help="Restrict --next to a group")
-    sp_v.add_argument("--raw", action="store_true", help="Show raw HTML instead of plain text")
-    sp_v.add_argument("--mark-read", action="store_true", help="(Legacy) Mark item as read after viewing (default behavior)")
-    sp_v.add_argument("--no-mark-read", action="store_true", help="Do not mark item as read after viewing")
-    sp_v.set_defaults(func=cmd_view)
+    # Alias handled via main parser (v)
 
-    sp = sub.add_parser("open", help="Open item link(s) in system browser")
-    sp.add_argument("ids", type=int, nargs="+", help="Item ID(s)")
+    sp = sub.add_parser("open", help="Open item link(s) in system browser", aliases=["o"]) 
+    sp.add_argument("ids", type=str, nargs="+", help="Item ID(s) (decimal or base36)")
     sp.add_argument("--mark-read", action="store_true", help="Mark item(s) as read after opening")
     sp.set_defaults(func=cmd_open)
 
     # 'o' is a short alias of 'open'
-    sp_o = sub.add_parser("o", help="Alias for 'open'")
-    sp_o.add_argument("ids", type=int, nargs="+", help="Item ID(s)")
-    sp_o.add_argument("--mark-read", action="store_true", help="Mark item(s) as read after opening")
-    sp_o.set_defaults(func=cmd_open)
+    # Alias handled via main parser (o)
 
     sp = sub.add_parser("edit", help="Open item content in your editor")
-    sp.add_argument("id", type=int, help="Item ID")
+    sp.add_argument("id", type=str, help="Item ID (decimal or base36)")
     sp.add_argument("--part", choices=["content", "summary", "title", "link", "url"], default="content", help="Which field to open (default: content)")
     sp.add_argument("--plain", action="store_true", help="Convert HTML to plain text for content/summary")
     sp.set_defaults(func=cmd_edit)
 
     sp = sub.add_parser("copy", help="Copy a field from one or more items to the system clipboard")
-    sp.add_argument("ids", type=int, nargs="+", help="Item ID(s)")
+    sp.add_argument("ids", type=str, nargs="+", help="Item ID(s) (decimal or base36)")
     sp.add_argument("--part", choices=["title", "summary", "content", "link", "url"], help="Which field to copy (default: from config, else url)")
     sp.add_argument("--plain", action="store_true", help="Convert HTML to plain text for content/summary")
     sp.set_defaults(func=cmd_copy)
@@ -4399,12 +4584,12 @@ def build_parser():
     sp_sync.set_defaults(func=cmd_files_sync)
 
     # sync: fetch + export in one go (pivot to downloader)
-    sp_all = sub.add_parser("sync", help="Fetch feeds and export grouped files")
+    sp_all = sub.add_parser("sync", help="Fetch feeds and export grouped files", aliases=["s"]) 
     sp_all.add_argument("--group", "-g", help="Only process this group")
     sp_all.add_argument("--id", type=int, help="Only fetch/export this source by numeric id")
     sp_all.add_argument("--ids", help="Only fetch/export these sources by id list (comma/space separated)")
     sp_all.add_argument("--source", help="Only fetch/export this source by URL or numeric id string")
-    sp_all.add_argument("--tier", help="Only fetch/export feeds with this tier(s) 1-5 (comma/space)")
+    sp_all.add_argument("--tier", "-t", help="Only fetch/export feeds with this tier(s) 1-5 (comma/space)")
     sp_all.add_argument("--debug", action="store_true", help="Verbose debug: print selected feeds and HTTP request details")
     sp_all.add_argument("--color", action="store_true", help="Colorize output lines")
     sp_all.add_argument("--nocolor", action="store_true", help="Force-disable ANSI colors in output")
@@ -4418,8 +4603,12 @@ def build_parser():
     sp_all.add_argument("--no-auto-tags", dest="auto_tags", action="store_false", help="Disable auto-tagging before export")
     sp_all.add_argument("--max-tags", type=int, default=5, help="Max tags per item when auto-tagging (default: 5)")
     sp_all.add_argument("--include-domain", action="store_true", help="Include site domain as a tag during auto-tagging")
+    # Export toggle override
+    sp_all.add_argument("--write-file", action="store_true", help="Override config (sync_write_files) and write files in the export step")
     sp_all.set_defaults(auto_tags=True)
     sp_all.set_defaults(func=cmd_sync)
+
+    # sync alias handled via aliases on main parser (s)
 
     # cold: archive filtered items into a tar(.gz) file
     sp_cold = sub.add_parser("cold", help="Cold storage: save filtered items into a tar or tar.gz")
@@ -4437,6 +4626,8 @@ def build_parser():
     sp_cold.add_argument("--query", "-q", help="Search in title/summary")
     sp_cold.add_argument("--since", help="Filter by date/time >= (e.g., 2025-10-16 or 2025-10-16 12:00 or 'today')")
     sp_cold.add_argument("--until", help="Filter by date/time < (exclusive)")
+    sp_cold.add_argument("--from", dest="since", help="Alias for --since")
+    sp_cold.add_argument("--to", dest="until", help="Alias for --until")
     sp_cold.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp_cold.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
     sp_cold.add_argument("--source", help="Filter by a source (url or numeric id)")
@@ -4445,7 +4636,19 @@ def build_parser():
     sp_cold.set_defaults(func=cmd_cold)
 
     # pick: fuzzy filter; outputs like list using show flags
-    sp_pick = sub.add_parser("pick", help="Fuzzy-pick items (filters) and print them like list")
+    PICK_DESC = (
+        "Fuzzy-pick items and print them like 'list'.\n\n"
+        "Filters and options mirror 'list' (group/tier/tags/dates/sorting).\n"
+        "Grouping: --group-by date|group|tier|tag|source.\n"
+        "Grid/meta, colors, highlights, export all supported.\n"
+    )
+    sp_pick = sub.add_parser(
+        "pick",
+        help="Fuzzy-pick items (filters) and print them like list",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description=PICK_DESC,
+        aliases=["p"],
+    )
     sp_pick.add_argument("--group", "-g", help="Filter by group")
     sp_pick.add_argument("--tier", help="Filter by feed tier(s) 1-5 (comma/space)")
     sp_pick.add_argument("--tags", help="Comma/space separated tag names; item must have ALL")
@@ -4480,6 +4683,7 @@ def build_parser():
     sp_pick.add_argument("--show-path", action="store_true")
     sp_pick.add_argument("--show-date", action="store_true")
     sp_pick.add_argument("--show-snippet", action="store_true")
+    sp_pick.add_argument("--show-code", action="store_true")
     sp_pick.add_argument("--show-meta", action="store_true")
     sp_pick.add_argument("--show-meta-data", action="store_true")
     sp_pick.add_argument("--show-guid", action="store_true")
@@ -4492,6 +4696,9 @@ def build_parser():
     sp_pick.add_argument("--dest", help="Export destination directory (defaults to export_dir in config)")
     sp_pick.add_argument("--format", choices=["md", "txt", "json", "html"], help="Export format (defaults to export_format in config)")
     sp_pick.set_defaults(func=cmd_pick)
+
+    # 'p' is a short alias of 'pick'
+    # Alias handled via main parser (p)
 
     # pick-tags: choose a tag via fzf/basic picker and show connected items
     sp_pt = sub.add_parser("pick-tags", help="Pick a tag (fzf if available) and print matching items like list")
@@ -4583,7 +4790,7 @@ def build_parser():
     sp_arch = sub.add_parser("archive", help="Archive items, sources, or groups")
     suba = sp_arch.add_subparsers(dest="arch_cmd", required=True)
     sp_aid = suba.add_parser("id", help="Archive or unarchive by item id")
-    sp_aid.add_argument("id", type=int)
+    sp_aid.add_argument("id", type=str)
     sp_aid.add_argument("--undo", action="store_true", help="Unarchive (restore)")
     sp_aid.set_defaults(func=cmd_archive_id)
 
@@ -4603,7 +4810,7 @@ def build_parser():
 
     # star: favorites with --undo for consistency
     sp_star = sub.add_parser("star", help="Star/unstar items (favorites)")
-    sp_star.add_argument("ids", type=int, nargs="+", help="Item ID(s)")
+    sp_star.add_argument("ids", type=str, nargs="+", help="Item ID(s) (decimal or base36)")
     sp_star.add_argument("--undo", action="store_true", help="Unstar instead of star")
     sp_star.set_defaults(func=cmd_star)
 
@@ -4621,7 +4828,7 @@ def build_parser():
     sp_del = sub.add_parser("delete", help="Soft-delete items")
     subd = sp_del.add_subparsers(dest="del_cmd", required=True)
     sp_did = subd.add_parser("id", help="Delete or undelete item by id")
-    sp_did.add_argument("id", type=int)
+    sp_did.add_argument("id", type=str)
     sp_did.add_argument("--undo", action="store_true", help="Undelete instead of delete")
     sp_did.add_argument("--force", action="store_true", help="Allow deleting starred items")
     sp_did.set_defaults(func=cmd_delete_id)
@@ -4691,7 +4898,7 @@ def build_parser():
     sp_tr = sub.add_parser("trash", help="Alias: soft-delete items")
     subtr = sp_tr.add_subparsers(dest="trash_cmd", required=True)
     sp_trid = subtr.add_parser("id", help="Delete or undelete item by id")
-    sp_trid.add_argument("id", type=int)
+    sp_trid.add_argument("id", type=str)
     sp_trid.add_argument("--undo", action="store_true")
     sp_trid.add_argument("--force", action="store_true")
     sp_trid.set_defaults(func=cmd_delete_id)
@@ -4719,6 +4926,8 @@ def build_parser():
     sp_stats.add_argument("--source", help="Filter by source (url or numeric id)")
     sp_stats.add_argument("--since", help="Filter items by date/time >=")
     sp_stats.add_argument("--until", help="Filter items by date/time < (exclusive)")
+    sp_stats.add_argument("--from", dest="since", help="Alias for --since")
+    sp_stats.add_argument("--to", dest="until", help="Alias for --until")
     sp_stats.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp_stats.add_argument("--date-field", choices=["published", "created"], default="published")
     sp_stats.add_argument("--top", type=int, default=10, help="Top N for tags/sources (default: 10)")

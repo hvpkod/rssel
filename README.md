@@ -27,9 +27,10 @@ Configuration
   - Write: `python3 rssel.py config template --write`
 - Notable options
   - Paths: `data_dir`, `sources_file`, `stopwords_file`, `highlight_words_file`
-  - Display: `display_*`, `display_snippet_len`
+  - Display: `display_*`, `display_snippet_len`, `display_show_code`, `display_grid`, `display_json`, `display_highlight`, `display_highlight_only`
   - Internal export: `export_dir`, `export_format`
   - External export: `external_export_dir`, `external_export_format`
+  - Sync writing: `sync_write_files` (true/false) to control whether `sync` writes files; override per‑run with `sync --write-file`
   - New items window: `new_hours`
   - Copy defaults: `copy_default_part`, `copy_default_plain`, `copy_separator`
   - Auto‑tagging: `sync_auto_tags`, `sync_max_tags`, `sync_include_domain`
@@ -53,28 +54,29 @@ Key Commands
   - Add `--with-db` to include DB status: archived flag and current item counts
   - Add `--include-db-only` with `--with-db` to also list DB-only sources not present in the config (useful after purges or config edits)
 - `rssel sync` — fetch + auto‑tag + export
-  - `--group Gs` `--dest DIR` `--format md|txt|json|html` `--clean` `--no-auto-tags` `--max-tags K` `--include-domain`
+  - `--group Gs` `--dest DIR` `--format md|txt|json|html` `--clean` `--no-auto-tags` `--max-tags K` `--include-domain` `--write-file`
+  - Controlled by `sync_write_files` in config; use `--write-file` to force enabling for a run
 - `rssel fetch [--group Gs]` — fetch only
   - Filter by tier: `--tier 1,2,3`
 - `rssel list` — filter and print items
   - Filters: `--group Gs` `--tags T1,T2` `--limit N` `--unread-only|--read|--star` `--query Q`
-  - Dates: `--since D` `--until D` `--on D` `--date-field published|created`
+  - Dates: `--since D` `--until D` `--on D` `--date-field published|created` (aliases: `--from`, `--to`)
   - Source: `--source URL|ID` to filter; `--sources` (or `--list-sources`) to list a summary with ids
   - Sort: `--sort-id` (id desc), `--sort-id-rev` (id asc), `--sort-name` (title A→Z), `--sort-group` (group A→Z, then newest), `--sort-count` (by tag count desc), `--sort-date-new` (newest), `--sort-date-old` (oldest)
   - Show (non‑grid): `--show-source|--show-url|--show-tags|--show-path|--show-date|--show-snippet`
     - Suppress tags even if enabled in config: `--no-show-tags`
   - Grid: `--grid` prints a base row (id, markers, groups, title). To include extra metadata rows in grid, use `--grid-meta date,path,url,tags,source,snippet` (comma or space list). Each selected meta prints as `id  label: value` on its own row.
-  - JSON: `--json` outputs a JSON array. By default includes base fields (id, title, read, published_ts, primary_group, groups, feed_url, highlight). Optional fields (date, source, link, path, tags, snippet) are included only if you also pass the corresponding `--show-*` flags. JSON is plain (no ANSI colors).
+  - JSON: `--json` outputs a JSON array. By default includes base fields (id, title, read, published_ts, primary_group, groups, feed_url, highlight). Optional fields (date, source, link, path, tags, snippet) are included only if you also pass the corresponding `--show-*` flags. JSON is plain (no ANSI colors). Short codes are not included in JSON.
   - Color: `--color` enables ANSI colors; use `--nocolor` to disable
   - Highlight: `--highlight` (marks matches with `!`), `--highlight-only` (filter to matches)
-- `rssel pick` — fuzzy filter (fzf if available) with same filters as list
+- `rssel pick` — fuzzy filter (fzf if available) with same filters as list; supports `--group-by date|group|tier|tag|source` and grid/meta/highlight/export
 -- `rssel tags auto|list|items|map|compact` — tagging tools
   - `tags list`: sort with `--sort name|count-asc|count-desc` (default: count-desc), limit with `--top N`
   - `tags map`: `--sort name|count-asc|count-desc`, `--top N`, `--min-count N`, `--max-per-tag N`, `--color`
   - `tags compact`: one-line; supports `--sort name|count-asc|count-desc`, `--top N`, `--min-count N`, `--max-per-tag N`, `--color`
   - Shortcut: `rssel list --list-tags` also supports `--group`, `--tags-sort`, `--tags-top`
 - `rssel view` — open in pager; `read` alias
-- Short aliases: `v` for view, `o` for open
+- Short aliases: `l`=list, `s`=sync, `p`=pick, `v`=view, `o`=open, `m`=mark, `read`=view
 - `rssel open` — open link(s) in browser
 - `rssel export` — export outside the project tree
 - `rssel copy` — copy fields to clipboard
@@ -151,6 +153,7 @@ Notes
 - Editor: uses `$RSSEL_EDITOR`, `$EDITOR`, or `editor` in config (default `nvim`).
 - Pager: uses `$RSSEL_PAGER`/`$PAGER`, falls back to `less`/`more`.
 - File tree: `./.rssel/fs/<group>/<id>-<slug>.<ext>` with a small metadata header.
+ - Filenames use ASCII slugs (safe for most filesystems). Content/tags preserve Unicode.
  
 Cold Storage (tar.gz)
 - Archive filtered items to a tar.gz (default) or tar with the same filters as `list`:
