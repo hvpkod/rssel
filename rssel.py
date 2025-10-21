@@ -29,7 +29,7 @@ APP_NAME = "rssel"
 # Nicely structured help epilog shown in `--help`
 HELP_EPILOG = (
     "Aliases\n"
-    "  l=list, s=sync, p=pick, v=view, o=open, m=mark, read=view\n\n"
+    "  l=list, ls=list, s=sync, p=pick, v=view, o=open, m=mark, read=view\n\n"
     "Short flags\n"
     "  -g/--group, -t/--tier, -n/--limit, -c/--color\n\n"
     "Short item codes\n"
@@ -47,6 +47,17 @@ HELP_EPILOG = (
     "  v 3r2t6              # view by short code\n"
     "  v --next -g news     # next unread in group\n"
     "  p -g news --grid --grid-meta date,url,tags\n"
+    "\nCommon Commands\n"
+    "  list (l, ls)   Filter items; group/sort; JSON; export\n"
+    "  pick (p)       Fuzzy-pick items; same filters/group-by as list\n"
+    "  sync (s)       Fetch + auto-tag + export (see --write-file)\n"
+    "  fetch          Fetch only (supports --group/--tier/--source)\n"
+    "  tags list/map/compact/items   Tag summaries and item views (JSON)\n"
+    "  sources        Show sources (optionally with DB info)\n"
+    "  stats          Database stats (filters + --json coming soon)\n"
+    "  purge/pd       Cleanup deleted/older; --clean-tags; --vacuum\n"
+    "  archive/delete/star   Manage items and sources\n"
+    "  view (v, read) Read in pager; open (o) open in browser; copy/export\n"
     "\nRun 'rssel <command> --help' for full options of each command.\n"
 )
 
@@ -159,6 +170,7 @@ def full_config_template() -> str:
         "display_show_date = \"false\"\n"
         "display_show_snippet = \"false\"\n"
         "display_show_code = \"true\"\n"
+        "display_show_source = \"false\"\n"
         "display_grid = \"false\"\n"
         "display_json = \"false\"\n"
         "display_highlight = \"false\"\n"
@@ -174,12 +186,7 @@ def full_config_template() -> str:
         "new_hours = \"24\"\n\n"
         "# list default max items (used when --limit not set)\n"
         "list_max = \"2000\"\n\n"
-        "# Tiered fetch intervals (hours); 1 = highest frequency, 5 = lowest\n"
-        "fetch_tier1_hours = \"1\"\n"
-        "fetch_tier2_hours = \"3\"\n"
-        "fetch_tier3_hours = \"6\"\n"
-        "fetch_tier4_hours = \"12\"\n"
-        "fetch_tier5_hours = \"24\"\n\n"
+        "# (Deprecated) Tiered fetch intervals have been removed\n\n"
         "# copy defaults\n"
         "# part: url|title|summary|content\n"
         "copy_default_part = \"url\"\n"
@@ -828,7 +835,7 @@ def cmd_fetch(args):
         print("No sources configured. Run 'rssel init'.", file=sys.stderr)
         return 1
     # Color helper
-    use_color = bool(getattr(args, "color", False)) and not bool(getattr(args, "nocolor", False))
+    use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False))
     def c(text, *codes):
         return _maybe(text, use_color, *codes)
     # Validate duplicate URLs in sources
@@ -1700,8 +1707,17 @@ def cmd_list(args):
             else:
                 for tg in tags:
                     group_map.setdefault(tg, []).append((iid, ts, read, grp, title, feed_url))
-        for label in sorted(group_map.keys(), key=lambda s: s.lower()):
-            header = f"Tag: {label} ({len(group_map[label])})"
+        # Sort tags by count desc then name, and optionally limit via --tags-top
+        tag_counts = [(name, len(items)) for name, items in group_map.items()]
+        tag_counts.sort(key=lambda x: (-x[1], x[0].lower()))
+        topk = getattr(args, "tags_top", None)
+        if topk:
+            try:
+                tag_counts = tag_counts[: max(0, int(topk))]
+            except Exception:
+                pass
+        for (label, cnt) in tag_counts:
+            header = f"Tag: {label} ({cnt})"
             print(_maybe(header, opts.get('color'), 1))
             for (iid, ts, read, grp, title, feed_url) in group_map[label]:
                 _process_row(iid, ts, read, grp, title, feed_url)
@@ -3006,7 +3022,7 @@ def cmd_sync(args):
     Defaults to cleaned-up Markdown files under ./.rssel/fs.
     """
     # Fetch
-    use_color = bool(getattr(args, "color", False)) and not bool(getattr(args, "nocolor", False))
+    use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False))
     def c(text, *codes):
         return _maybe(text, use_color, *codes)
     entries = read_sources_entries()
@@ -3438,11 +3454,17 @@ def cmd_tags_list(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
+    use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False)) and not bool(getattr(args, "json", False))
     where = ["items.deleted = 0"]
     params: list = []
     if args.group:
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
+    # Optional source filter (url or numeric id)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     # Sorting + limit
     tsort = getattr(args, "sort", None) or "count-desc"
@@ -3466,8 +3488,14 @@ def cmd_tags_list(args):
     """
     cur.execute(sql, params)
     rows = cur.fetchall()
+    if getattr(args, "json", False):
+        data = [{"name": name, "count": int(cnt)} for (name, cnt) in rows]
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
     for name, cnt in rows:
-        print(f"{cnt:5d}  {name}")
+        cnt_s = _maybe(f"{int(cnt):5d}", use_color, 2)
+        name_s = _maybe(name, use_color, 36)
+        print(f"{cnt_s}  {name_s}")
     return 0
 
 
@@ -3504,6 +3532,11 @@ def cmd_tags_items(args):
     if args.group:
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
+    # Optional source filter (url or numeric id)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     if args.unread_only:
         where.append("items.read = 0")
     where_sql = " AND ".join(where)
@@ -3520,6 +3553,18 @@ def cmd_tags_items(args):
     """
     cur.execute(sql, params)
     rows = cur.fetchall()
+    if getattr(args, "json", False):
+        out = []
+        for (iid, ts, read, grp, title, summary) in rows:
+            out.append({
+                "id": int(iid),
+                "title": title or "",
+                "read": bool(read),
+                "published_ts": int(ts) if ts else None,
+                "group": grp,
+            })
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
     header_name = ", ".join(tag_header)
     print(f"Tags: {header_name}  (items: {len(rows)})")
     opts = resolve_display_opts(args)
@@ -3558,12 +3603,18 @@ def cmd_tags_map(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
+    use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False)) and not bool(getattr(args, "json", False))
     # Get tags ordered by count (optionally filtered by group)
     where = ["items.deleted = 0"]
     params: list = []
     if args.group:
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
+    # Optional source filter (url or numeric id)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     top_limit = f"LIMIT {int(args.top)}" if args.top else ""
     having_sql = ""
@@ -3593,32 +3644,50 @@ def cmd_tags_map(args):
     """
     cur.execute(sql_tags, params_tags)
     tags = cur.fetchall()
+    out_json = []
     for (tid, name, cnt) in tags:
         # Fetch items for this tag
-        sql_items = """
+        sql_items = (
+            """
             SELECT items.id, items.published_ts, items.read, feeds.grp, items.title
             FROM items
             JOIN item_tags it ON it.item_id = items.id
             JOIN feeds ON feeds.url = items.feed_url
             WHERE it.tag_id = ? AND items.deleted = 0
+            """
+        )
+        if src_sql:
+            sql_items += " AND " + src_sql + "\n"
+        sql_items += (
+            """
             ORDER BY items.published_ts DESC, items.id DESC
             LIMIT ?
-        """
-        cur.execute(sql_items, (tid, int(args.max_per_tag)))
+            """
+        )
+        cur.execute(sql_items, ((tid,) + tuple(src_params) + (int(args.max_per_tag),)) if src_sql else (tid, int(args.max_per_tag)))
         rows = cur.fetchall()
+        if getattr(args, "json", False):
+            out_json.append({
+                "tag": name,
+                "count": int(cnt),
+                "ids": [int(r[0]) for r in rows],
+            })
+            continue
         # Default to compact unless --detailed is explicitly set
         if getattr(args, "compact", False) or not getattr(args, "detailed", False):
             ids = [r[0] for r in rows]
             # Python-list style on one line
-            tname = _maybe(name, True, 36) if getattr(args, "color", False) else name
-            print(f"{tname} ({cnt}): [" + ", ".join(str(i) for i in ids) + "]")
+            tname = _maybe(name, use_color, 36) if use_color else name
+            cstr = _maybe(str(cnt), use_color, 2)
+            print(f"{tname} ({cstr}): [" + ", ".join(str(i) for i in ids) + "]")
         else:
-            hname = _maybe(name, True, 36) if getattr(args, "color", False) else name
-            print(f"[{hname}] ({cnt})")
+            hname = _maybe(name, use_color, 36) if use_color else name
+            cstr = _maybe(str(cnt), use_color, 2)
+            print(f"[{hname}] ({cstr})")
             for (iid, ts, read, grp, title) in rows:
                 mark = " " if read else "*"
                 dt = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "----"
-                if getattr(args, "color", False):
+                if use_color:
                     id_s = _maybe(f"{iid:6d}", True, 2)
                     grp_s = f"[{_maybe(grp, True, 36)}]"
                     dt_s = _maybe(dt, True, 2)
@@ -3626,6 +3695,9 @@ def cmd_tags_map(args):
                     print(f"  {id_s} {mark} {grp_s} {dt_s}  {title_s}")
                 else:
                     print(f"  {iid:6d} {mark} [{grp}] {dt}  {title or ''}")
+    if getattr(args, "json", False):
+        print(json.dumps(out_json, ensure_ascii=False, indent=2))
+        return 0
     return 0
 
 
@@ -3755,11 +3827,17 @@ def cmd_tags_compact(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
+    use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False)) and not bool(getattr(args, "json", False))
     where = ["items.deleted = 0"]
     params: list = []
     if args.group:
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
+    # Optional source filter (url or numeric id)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     # Sorting, limit, and min-count for compact
     top_limit = f"LIMIT {int(args.top)}" if args.top else ""
@@ -3790,6 +3868,7 @@ def cmd_tags_compact(args):
     cur.execute(sql_tags, params_tags)
     tags = cur.fetchall()
     chunks: list[str] = []
+    out = []
     for (tid, name, cnt) in tags:
         sql_items = """
             SELECT items.id
@@ -3801,14 +3880,20 @@ def cmd_tags_compact(args):
         """
         cur.execute(sql_items, (tid, int(args.max_per_tag)))
         ids = [str(r[0]) for r in cur.fetchall()]
-        if getattr(args, "color", False):
-            name_s = _maybe(name, True, 36)
-            cnt_s = _maybe(str(cnt), True, 2)
-            chunk = f"{name_s} ({cnt_s}): [" + ", ".join(ids) + "]"
+        if getattr(args, "json", False):
+            out.append({"tag": name, "count": int(cnt), "ids": [int(i) for i in ids]})
         else:
-            chunk = f"{name} ({cnt}): [" + ", ".join(ids) + "]"
-        chunks.append(chunk)
-    print("; ".join(chunks))
+            if use_color:
+                name_s = _maybe(name, True, 36)
+                cnt_s = _maybe(str(cnt), True, 2)
+                chunk = f"{name_s} ({cnt_s}): [" + ", ".join(ids) + "]"
+            else:
+                chunk = f"{name} ({cnt}): [" + ", ".join(ids) + "]"
+            chunks.append(chunk)
+    if getattr(args, "json", False):
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        print("; ".join(chunks))
     return 0
 
 
@@ -4412,8 +4497,16 @@ def cmd_pick(args):
             else:
                 for tg in tags:
                     groups.setdefault(tg, []).append((iid, ts, read, grp, title, feed_url))
-        for lb in sorted(groups.keys(), key=lambda s: s.lower()):
-            print(_maybe(f"Tag: {lb} ({len(groups[lb])})", opts.get('color'), 1))
+        tag_counts = [(name, len(items)) for name, items in groups.items()]
+        tag_counts.sort(key=lambda x: (-x[1], x[0].lower()))
+        topk = getattr(args, "tags_top", None)
+        if topk:
+            try:
+                tag_counts = tag_counts[: max(0, int(topk))]
+            except Exception:
+                pass
+        for (lb, cnt) in tag_counts:
+            print(_maybe(f"Tag: {lb} ({cnt})", opts.get('color'), 1))
             for (iid, ts, read, grp, title, feed_url) in groups[lb]:
                 print_row(iid, ts, read, grp, title, feed_url)
         return 0
@@ -4464,7 +4557,7 @@ def build_parser():
         "Export: --export [--dest --format]. JSON: --json.\n"
         "Show short codes: --show-code (or config display_show_code=true).\n"
     )
-    sp = sub.add_parser("list", help="List cached items", aliases=["l"], formatter_class=argparse.RawTextHelpFormatter, description=LIST_DESC)
+    sp = sub.add_parser("list", help="List cached items", aliases=["l", "ls"], formatter_class=argparse.RawTextHelpFormatter, description=LIST_DESC)
     sp.add_argument("--group", "-g", help="Filter by group")
     sp.add_argument("--tier", help="Filter by feed tier(s) 1-5 (comma/space)")
     sp.add_argument("--group-by", choices=["date", "group", "tier", "tag", "source"], help="Group printed output (date/group/tier/tag/source)")
@@ -4665,6 +4758,7 @@ def build_parser():
     # Grouping like list
     sp_pick.add_argument("--group-by", choices=["date", "group", "tier", "tag", "source"], help="Group printed output (date/group/tier/tag/source)")
     sp_pick.add_argument("--date-bucket", choices=["day", "week", "month"], default="day", help="Bucket for --group-by date")
+    sp_pick.add_argument("--tags-top", type=int, help="Limit number of tag groups when --group-by tag")
     # Sorting options similar to list
     sp_pick.add_argument("--sort-id", action="store_true")
     sp_pick.add_argument("--sort-id-rev", action="store_true")
@@ -4701,23 +4795,34 @@ def build_parser():
     # Alias handled via main parser (p)
 
     # pick-tags: choose a tag via fzf/basic picker and show connected items
-    sp_pt = sub.add_parser("pick-tags", help="Pick a tag (fzf if available) and print matching items like list")
-    sp_pt.add_argument("--group", "-g", help="Filter tags/items by group")
-    sp_pt.add_argument("--tags", help="Additional required tags (comma/space separated) for the second stage item filter")
-    sp_pt.add_argument("--unread-only", action="store_true", help="Only include unread items")
-    sp_pt.add_argument("--limit", "-n", type=int, help="Limit items per tag shown")
-    sp_pt.add_argument("--no-fzf", action="store_true", help="Force basic picker without fzf")
-    sp_pt.add_argument("--show-url", action="store_true", help="Show URL as indented metadata under each item")
-    sp_pt.add_argument("--show-tags", action="store_true", help="Show tags as indented metadata under each item")
-    sp_pt.add_argument("--show-path", action="store_true", help="Show expected file path as indented metadata under each item")
-    sp_pt.add_argument("--show-date", action="store_true", help="Show published date as indented metadata under each item")
-    sp_pt.add_argument("--show-snippet", action="store_true", help="Show a short text snippet under each item")
-    sp_pt.add_argument("--preview", action="store_true", help="Show a preview of items for the highlighted tag in fzf")
-    sp_pt.add_argument("--multi", action="store_true", help="Allow selecting multiple items in fzf stage")
-    sp_pt.add_argument("--color", action="store_true", help="Colorize printed outputs")
-    sp_pt.add_argument("--export", action="store_true", help="Export the filtered items to files")
-    sp_pt.add_argument("--dest", help="Export destination directory (defaults to export_dir in config)")
-    sp_pt.add_argument("--format", choices=["md", "txt", "json", "html"], help="Export format (defaults to export_format in config)")
+    sp_pt = sub.add_parser(
+        "pick-tags",
+        help="Pick a tag (fzf if available) and print matching items like list",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Fuzzy-pick a tag and then print items (like list).",
+    )
+    pt_filters = sp_pt.add_argument_group("Filters")
+    pt_filters.add_argument("--group", "-g", help="Filter tags/items by group")
+    pt_filters.add_argument("--tags", help="Additional required tags (comma/space) for the second stage item filter")
+    pt_filters.add_argument("--unread-only", action="store_true", help="Only include unread items")
+    pt_filters.add_argument("--limit", "-n", type=int, help="Limit items per tag shown")
+    pt_interactive = sp_pt.add_argument_group("Interactive")
+    pt_interactive.add_argument("--no-fzf", action="store_true", help="Force basic picker without fzf")
+    pt_interactive.add_argument("--preview", action="store_true", help="Show a preview pane in fzf for highlighted items")
+    pt_interactive.add_argument("--multi", action="store_true", help="Allow selecting multiple items in fzf stage")
+    pt_display = sp_pt.add_argument_group("Display")
+    pt_display.add_argument("--show-url", action="store_true", help="Show URL as indented metadata under each item")
+    pt_display.add_argument("--show-tags", action="store_true", help="Show tags as indented metadata under each item")
+    pt_display.add_argument("--show-path", action="store_true", help="Show expected file path as indented metadata under each item")
+    pt_display.add_argument("--show-date", action="store_true", help="Show published date as indented metadata under each item")
+    pt_display.add_argument("--show-snippet", action="store_true", help="Show a short text snippet under each item")
+    pt_display.add_argument("--show-source", action="store_true", help="Show the source (title or URL) as an indented metadata line")
+    pt_display.add_argument("--color", action="store_true", help="Colorize printed outputs")
+    pt_display.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output")
+    pt_export = sp_pt.add_argument_group("Export")
+    pt_export.add_argument("--export", action="store_true", help="Export the filtered items to files")
+    pt_export.add_argument("--dest", help="Export destination directory (defaults to export_dir in config)")
+    pt_export.add_argument("--format", choices=["md", "txt", "json", "html"], help="Export format (defaults to export_format in config)")
     sp_pt.set_defaults(func=cmd_pick_tags)
 
     # preview helper for fzf
@@ -4744,46 +4849,90 @@ def build_parser():
     sp_auto.add_argument("--dry-run", action="store_true", help="Show tags but do not save")
     sp_auto.set_defaults(func=cmd_tags_auto)
 
-    sp_listtags = subt.add_parser("list", help="List tags with counts")
-    sp_listtags.add_argument("--group", "-g", help="Filter by group")
-    sp_listtags.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort order (default: count-desc)")
-    sp_listtags.add_argument("--top", type=int, help="Limit number of tags shown")
+    sp_listtags = subt.add_parser(
+        "list",
+        help="List tags with counts",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="List tag counts (optionally filtered by group/source).",
+    )
+    tl_filters = sp_listtags.add_argument_group("Filters")
+    tl_filters.add_argument("--group", "-g", help="Filter by group")
+    tl_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    tl_sort = sp_listtags.add_argument_group("Sorting")
+    tl_sort.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort order (default: count-desc)")
+    tl_sort.add_argument("--top", type=int, help="Limit number of tags shown")
+    tl_out = sp_listtags.add_argument_group("Output")
+    tl_out.add_argument("--json", action="store_true", help="Output tags as JSON (name/count)")
     sp_listtags.set_defaults(func=cmd_tags_list)
 
-    sp_items = subt.add_parser("items", help="List items for a tag or tag set")
-    sp_items.add_argument("--tag", required=True, help="Tag name (case-insensitive). Comma/space separated for ALL-match (e.g. 'us, trump')")
-    sp_items.add_argument("--group", "-g", help="Filter by group")
-    sp_items.add_argument("--limit", "-n", type=int, help="Limit items")
-    sp_items.add_argument("--unread-only", action="store_true", help="Only unread items")
-    sp_items.add_argument("--show-url", action="store_true", help="Show URL as indented metadata")
-    sp_items.add_argument("--show-tags", action="store_true", help="Show tags as indented metadata")
-    sp_items.add_argument("--show-path", action="store_true", help="Show expected file path as indented metadata")
-    sp_items.add_argument("--show-date", action="store_true", help="Show published date as indented metadata")
-    sp_items.add_argument("--show-snippet", action="store_true", help="Show a short text snippet under each item")
-    sp_items.add_argument("--show-source", action="store_true", help="Show the source (title or URL) as an indented metadata line")
-    sp_items.add_argument("--color", action="store_true", help="Colorize output")
-    sp_items.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output (overrides --color and config)")
+    sp_items = subt.add_parser(
+        "items",
+        help="List items for a tag or tag set",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="List items that match a tag (or ALL-match for multiple tags).",
+    )
+    ti_filters = sp_items.add_argument_group("Filters")
+    ti_filters.add_argument("--tag", required=True, help="Tag name (case-insensitive). Comma/space separated for ALL-match (e.g. 'us, trump')")
+    ti_filters.add_argument("--group", "-g", help="Filter by group")
+    ti_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    ti_filters.add_argument("--limit", "-n", type=int, help="Limit items")
+    ti_filters.add_argument("--unread-only", action="store_true", help="Only unread items")
+    ti_disp = sp_items.add_argument_group("Display")
+    ti_disp.add_argument("--show-url", action="store_true", help="Show URL as indented metadata")
+    ti_disp.add_argument("--show-tags", action="store_true", help="Show tags as indented metadata")
+    ti_disp.add_argument("--show-path", action="store_true", help="Show expected file path as indented metadata")
+    ti_disp.add_argument("--show-date", action="store_true", help="Show published date as indented metadata")
+    ti_disp.add_argument("--show-snippet", action="store_true", help="Show a short text snippet under each item")
+    ti_disp.add_argument("--show-source", action="store_true", help="Show the source (title or URL) as an indented metadata line")
+    ti_disp.add_argument("--color", action="store_true", help="Colorize output")
+    ti_disp.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output")
+    ti_out = sp_items.add_argument_group("Output")
+    ti_out.add_argument("--json", action="store_true", help="Output items as JSON")
     sp_items.set_defaults(func=cmd_tags_items)
 
-    sp_map = subt.add_parser("map", help="Show tags with their items")
-    sp_map.add_argument("--group", "-g", help="Filter by group")
-    sp_map.add_argument("--top", type=int, help="Show only the top N tags by count")
-    sp_map.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
-    sp_map.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort tags (default: count-desc)")
-    sp_map.add_argument("--max-per-tag", type=int, default=10, help="Max items to list per tag (default: 10)")
-    sp_map.add_argument("--compact", action="store_true", help="Compact Python-list style: tag (count): [id, ...]")
-    sp_map.add_argument("--detailed", action="store_true", help="Show detailed lines with title/group/date")
-    sp_map.add_argument("--color", action="store_true", help="Colorize printed outputs")
+    sp_map = subt.add_parser(
+        "map",
+        help="Show tags with their items",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Show each tag with a list of matching item ids (or detailed lines).",
+    )
+    tm_filters = sp_map.add_argument_group("Filters")
+    tm_filters.add_argument("--group", "-g", help="Filter by group")
+    tm_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    tm_limits = sp_map.add_argument_group("Limits")
+    tm_limits.add_argument("--top", type=int, help="Show only the top N tags by count")
+    tm_limits.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
+    tm_limits.add_argument("--max-per-tag", type=int, default=10, help="Max items to list per tag (default: 10)")
+    tm_sort = sp_map.add_argument_group("Sorting")
+    tm_sort.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort tags (default: count-desc)")
+    tm_disp = sp_map.add_argument_group("Display")
+    tm_disp.add_argument("--compact", action="store_true", help="Compact Python-list style: tag (count): [id, ...]")
+    tm_disp.add_argument("--detailed", action="store_true", help="Show detailed lines with title/group/date")
+    tm_disp.add_argument("--color", action="store_true", help="Colorize printed outputs")
+    tm_out = sp_map.add_argument_group("Output")
+    tm_out.add_argument("--json", action="store_true", help="Output tags with id lists as JSON")
     sp_map.set_defaults(func=cmd_tags_map)
 
     # tags compact: all tags in a single line, super compact
-    sp_cmap = subt.add_parser("compact", help="One-line compact tag map: tag(count): [ids]; ...")
-    sp_cmap.add_argument("--group", "-g", help="Filter by group")
-    sp_cmap.add_argument("--top", type=int, help="Show only the top N tags by count")
-    sp_cmap.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
-    sp_cmap.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort tags (default: count-desc)")
-    sp_cmap.add_argument("--max-per-tag", type=int, default=10, help="Max items to include per tag (default: 10)")
-    sp_cmap.add_argument("--color", action="store_true", help="Colorize tag names and counts")
+    sp_cmap = subt.add_parser(
+        "compact",
+        help="One-line compact tag map: tag(count): [ids]; ...",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Compact one-line tag summary: tag(count): [ids]; …",
+    )
+    tc_filters = sp_cmap.add_argument_group("Filters")
+    tc_filters.add_argument("--group", "-g", help="Filter by group")
+    tc_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    tc_limits = sp_cmap.add_argument_group("Limits")
+    tc_limits.add_argument("--top", type=int, help="Show only the top N tags by count")
+    tc_limits.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
+    tc_limits.add_argument("--max-per-tag", type=int, default=10, help="Max items to include per tag (default: 10)")
+    tc_sort = sp_cmap.add_argument_group("Sorting")
+    tc_sort.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort tags (default: count-desc)")
+    tc_disp = sp_cmap.add_argument_group("Display")
+    tc_disp.add_argument("--color", action="store_true", help="Colorize tag names and counts")
+    tc_out = sp_cmap.add_argument_group("Output")
+    tc_out.add_argument("--json", action="store_true", help="Output compact tag map as JSON")
     sp_cmap.set_defaults(func=cmd_tags_compact)
 
     # archive: mark items or feeds/groups archived (feeds archived also skipped in fetch)

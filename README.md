@@ -71,12 +71,12 @@ Key Commands
   - Highlight: `--highlight` (marks matches with `!`), `--highlight-only` (filter to matches)
 - `rssel pick` — fuzzy filter (fzf if available) with same filters as list; supports `--group-by date|group|tier|tag|source` and grid/meta/highlight/export
 -- `rssel tags auto|list|items|map|compact` — tagging tools
-  - `tags list`: sort with `--sort name|count-asc|count-desc` (default: count-desc), limit with `--top N`
-  - `tags map`: `--sort name|count-asc|count-desc`, `--top N`, `--min-count N`, `--max-per-tag N`, `--color`
-  - `tags compact`: one-line; supports `--sort name|count-asc|count-desc`, `--top N`, `--min-count N`, `--max-per-tag N`, `--color`
+  - `tags list`: supports `--group`, `--source`, `--sort name|count-asc|count-desc` (default: count-desc), `--top N`
+  - `tags map`: supports `--group`, `--source`, `--sort name|count-asc|count-desc`, `--top N`, `--min-count N`, `--max-per-tag N`, `--color`
+  - `tags compact`: one-line; supports `--group`, `--source`, `--sort name|count-asc|count-desc`, `--top N`, `--min-count N`, `--max-per-tag N`, `--color`
   - Shortcut: `rssel list --list-tags` also supports `--group`, `--tags-sort`, `--tags-top`
 - `rssel view` — open in pager; `read` alias
-- Short aliases: `l`=list, `s`=sync, `p`=pick, `v`=view, `o`=open, `m`=mark, `read`=view
+- Short aliases: `l`=list, `ls`=list, `s`=sync, `p`=pick, `v`=view, `o`=open, `m`=mark, `read`=view
 - `rssel open` — open link(s) in browser
 - `rssel export` — export outside the project tree
 - `rssel copy` — copy fields to clipboard
