@@ -1207,7 +1207,7 @@ def cmd_list(args):
         url_w = 42
         def trunc(s, w):
             s = str(s)
-        return s if len(s) <= w else (s[: max(0, w - 3)] + "...")
+            return s if len(s) <= w else (s[: max(0, w - 3)] + "...")
         header = f"{'ID':>{id_w}}  {'Items':>{items_w}}  {'Tier':<{tier_w}}  {'Last':<{last_w}}  {'Name':<{name_w}}  {'URL':<{url_w}}  Tags"
         print(_maybe(header, opts.get('color'), 2))
         print("-" * len(header))
