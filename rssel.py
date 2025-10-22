@@ -177,7 +177,7 @@ def full_config_template() -> str:
         "display_highlight_only = \"false\"\n"
         "display_snippet_len = \"240\"\n\n"
         "# Internal file-tree export (list/pick/pick-tags --export and sync)\n"
-        "export_dir = \"./.rssel/fs\"\n"
+        "export_dir = \"./fs\"\n"
         "export_format = \"md\"\n\n"
         "# External export defaults (export --to file)\n"
         "external_export_dir = \"./export\"\n"
@@ -398,7 +398,7 @@ def read_config() -> dict:
         "sources_file": p["sources"],
         "stopwords_file": p["stopwords"],
         "highlight_words_file": p["highlights"],
-        "export_dir": os.path.join(rssel_home(), "fs"),
+        "export_dir": "./fs",
         "export_format": "md",
         "external_export_dir": None,
         "external_export_format": "md",
@@ -627,31 +627,96 @@ def cmd_sources(args):
             mapping.setdefault(g, []).append((title, url))
     # Optionally enrich with DB info (archived flag and item counts)
     db_cur = None
-    if getattr(args, "with_db", False):
+    need_db = bool(getattr(args, "with_db", False)) or (getattr(args, "sort", None) in ("count-asc", "count-desc"))
+    if need_db:
         conn = db_conn()
         init_db(conn)
         db_cur = conn.cursor()
+    # Optional group filter
+    allowed_groups: set[str] | None = None
+    if getattr(args, "group", None):
+        gs = _parse_groups_arg(args.group)
+        if gs:
+            allowed_groups = set(gs)
+    # Color handling
+    use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False)) and not bool(getattr(args, "json", False))
+    out_json = []
     for grp in sorted(mapping.keys()):
+        if allowed_groups is not None and grp not in allowed_groups:
+            continue
         items = mapping[grp]
-        print(f"[{grp}] ({len(items)})")
-        for (title, url) in items:
-            arch = ""
-            count_str = ""
-            if db_cur is not None:
+        if getattr(args, "json", False):
+            infos = []
+            for (title, url) in items:
+                rec = {"group": grp, "url": url, "title": title}
+                if db_cur is not None:
+                    try:
+                        db_cur.execute("SELECT archived FROM feeds WHERE url = ?", (url,))
+                        row = db_cur.fetchone(); rec["archived"] = bool(row[0]) if row else False
+                        db_cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
+                        cnt = (db_cur.fetchone() or (0,))[0]
+                        rec["item_count"] = int(cnt)
+                    except Exception:
+                        rec.setdefault("item_count", 0)
+                infos.append(rec)
+            # Sort and top (global across JSON)
+            srt = getattr(args, "sort", None)
+            if srt == "name":
+                infos.sort(key=lambda r: (str(r.get("title") or r.get("url") or "").lower()))
+            elif srt == "count-asc":
+                infos.sort(key=lambda r: int(r.get("item_count") or 0))
+            elif srt == "count-desc":
+                infos.sort(key=lambda r: -int(r.get("item_count") or 0))
+            if getattr(args, "top", None):
                 try:
-                    db_cur.execute("SELECT archived FROM feeds WHERE url = ?", (url,))
-                    row = db_cur.fetchone()
-                    if row and row[0]:
-                        arch = " [archived]"
-                    db_cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
-                    cnt = (db_cur.fetchone() or (0,))[0]
-                    count_str = f" (db items: {cnt})"
+                    infos = infos[: max(0, int(args.top))]
                 except Exception:
                     pass
-            if title:
-                print(f"  - {title}{arch} — {url}{count_str}")
-            else:
-                print(f"  - {url}{arch}{count_str}")
+            out_json.extend(infos)
+        else:
+            grp_lbl = _maybe(grp, use_color, 36)
+            cnt_lbl = _maybe(str(len(items)), use_color, 2)
+            print(f"[{grp_lbl}] ({cnt_lbl})")
+            # Build info records for sorting/top
+            infos = []
+            for (title, url) in items:
+                rec = {"title": title, "url": url, "archived": False, "item_count": None}
+                if db_cur is not None:
+                    try:
+                        db_cur.execute("SELECT archived FROM feeds WHERE url = ?", (url,))
+                        row = db_cur.fetchone(); rec["archived"] = bool(row[0]) if row else False
+                        db_cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
+                        cnt = (db_cur.fetchone() or (0,))[0]
+                        rec["item_count"] = int(cnt)
+                    except Exception:
+                        pass
+                infos.append(rec)
+            # Sort within group
+            srt = getattr(args, "sort", None)
+            if srt == "name" or not srt:
+                infos.sort(key=lambda r: (str(r.get("title") or r.get("url") or "").lower()))
+            elif srt == "count-asc":
+                infos.sort(key=lambda r: int(r.get("item_count") or 0))
+            elif srt == "count-desc":
+                infos.sort(key=lambda r: -int(r.get("item_count") or 0))
+            # Apply top per group
+            if getattr(args, "top", None):
+                try:
+                    k = max(0, int(args.top)); infos = infos[:k]
+                except Exception:
+                    pass
+            # Print
+            for rec in infos:
+                arch = (" " + _maybe("[archived]", use_color, 31)) if rec.get("archived") else ""
+                count_str = ""
+                if rec.get("item_count") is not None:
+                    count_str = " (db items: " + _maybe(str(rec["item_count"]), use_color, 2) + ")"
+                t = _maybe(rec.get("title"), use_color, 1) if rec.get("title") else None
+                u = _maybe(rec.get("url"), use_color, 36)
+                if t:
+                    print(f"  - {t}{arch} - {u}{count_str}")
+                else:
+                    print(f"  - {u}{arch}{count_str}")
     # Optionally list DB-only sources (not present in config)
     if db_cur is not None and getattr(args, "include_db_only", False):
         try:
@@ -659,16 +724,26 @@ def cmd_sources(args):
             db_cur.execute("SELECT url, COALESCE(title, url) as name, archived FROM feeds ORDER BY name COLLATE NOCASE")
             rows = db_cur.fetchall()
             extras = [(name, url, archived) for (url, name, archived) in rows if url not in cfg_urls]
-            if extras:
-                print(f"[DB-only] ({len(extras)})")
+            if extras and not getattr(args, "json", False):
+                print(f"[DB-only] ({_maybe(str(len(extras)), use_color, 2)})")
                 for (name, url, archived) in extras:
-                    arch = " [archived]" if archived else ""
+                    arch = (" " + _maybe("[archived]", use_color, 31)) if archived else ""
                     # Count items
                     db_cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
                     cnt = (db_cur.fetchone() or (0,))[0]
-                    print(f"  - {name}{arch} — {url} (db items: {cnt})")
+                    n = _maybe(name, use_color, 1)
+                    u = _maybe(url, use_color, 36)
+                    c = _maybe(str(cnt), use_color, 2)
+                    print(f"  - {n}{arch} - {u} (db items: {c})")
+            if extras and getattr(args, "json", False):
+                for (name, url, archived) in extras:
+                    db_cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ? AND deleted = 0", (url,))
+                    cnt = (db_cur.fetchone() or (0,))[0]
+                    out_json.append({"group": None, "url": url, "title": name, "archived": bool(archived), "item_count": int(cnt), "db_only": True})
         except Exception:
             pass
+    if getattr(args, "json", False):
+        print(json.dumps(out_json, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1039,7 +1114,7 @@ def _print_meta_block(conn: sqlite3.Connection, item: dict, dt: str, opts: dict)
             snippet = snippet.strip().replace("\n", " ")
             maxlen = int(opts.get("snippet_len", 240))
             if len(snippet) > maxlen:
-                snippet = snippet[:maxlen].rstrip() + "…"
+                snippet = snippet[:maxlen].rstrip() + "..."
             if snippet:
                 kv("snippet", snippet, 90, 90)  # gray
         elif field == "source" and opts.get("show_source"):
@@ -1132,7 +1207,7 @@ def cmd_list(args):
         url_w = 42
         def trunc(s, w):
             s = str(s)
-            return s if len(s) <= w else (s[: w - 1] + "…")
+        return s if len(s) <= w else (s[: max(0, w - 3)] + "...")
         header = f"{'ID':>{id_w}}  {'Items':>{items_w}}  {'Tier':<{tier_w}}  {'Last':<{last_w}}  {'Name':<{name_w}}  {'URL':<{url_w}}  Tags"
         print(_maybe(header, opts.get('color'), 2))
         print("-" * len(header))
@@ -1387,7 +1462,7 @@ def cmd_list(args):
             snippet = html_to_text(body_html)
             maxlen = int(opts.get("snippet_len", 240))
             if len(snippet) > maxlen:
-                snippet = snippet[:maxlen].rstrip() + "…"
+                snippet = snippet[:maxlen].rstrip() + "..."
             dt_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else None
             # Decide which metadata to include based strictly on CLI show flags
             want_url = bool(getattr(args, "show_url", False))
@@ -1450,7 +1525,7 @@ def cmd_list(args):
         if len(clean) <= w:
             return _pad(s, w)
         # truncate plain text and append ellipsis
-        return clean[: max(0, w - 1)] + "…"
+        return clean[: max(0, w - 3)] + "..."
     # Prepare grid settings
     if grid:
         col_id = 6
@@ -1553,7 +1628,7 @@ def cmd_list(args):
                     txt = html_to_text((item or {}).get("content") or (item or {}).get("summary") or "")
                     maxlen = int(opts.get("snippet_len", 240))
                     if len(txt) > maxlen:
-                        txt = txt[:maxlen].rstrip() + "…"
+                        txt = txt[:maxlen].rstrip() + "..."
                     val = _maybe(txt, opts["color"], 90, 90)
                 elif key == "meta":
                     if item is None:
@@ -1757,7 +1832,7 @@ def cmd_stats(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
-    color = getattr(args, "color", False) and not getattr(args, "nocolor", False)
+    color = (getattr(args, "color", False) or cfg_flag(read_config(), "display_color", False)) and not getattr(args, "nocolor", False)
 
     def c(text, *codes):
         return _maybe(text, color, *codes)
@@ -1880,6 +1955,18 @@ def cmd_stats(args):
     cur.execute(sql_srcs, params)
     src_rows = cur.fetchall()
 
+    if getattr(args, "json", False):
+        out = {
+            "feeds": {"total": feeds_total, "active": feeds_active, "archived": feeds_arch},
+            "items": {"all": items_all, "alive": items_alive, "unread": items_unread, "starred": items_star, "deleted": items_del},
+            "last": last_ts,
+            "new_window": {"hours": nh, "count": items_new_win},
+            "groups": [{"group": (g or "ungrouped"), "count": int(cnt)} for (g, cnt) in groups_rows],
+            "top_tags": [{"name": n, "count": int(cnt)} for (n, cnt) in tag_rows],
+            "top_sources": [{"name": name, "url": url, "count": int(cnt), "last_ts": int(lts) if lts else None} for (name, url, cnt, lts) in src_rows],
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
     # Print
     print(c("Feeds:", 1), f"total={feeds_total}", c("active=", 32) + str(feeds_active), c("archived=", 31) + str(feeds_arch))
     print(c("Items:", 1), f"all={items_all}", c("alive=", 32) + str(items_alive), c("unread=", 33) + str(items_unread), c("starred=", 33) + str(items_star), c("deleted=", 31) + str(items_del))
@@ -1898,7 +1985,7 @@ def cmd_stats(args):
         print(c("Top sources:", 1))
         for (name, url, cnt, lts) in src_rows:
             lstr = datetime.fromtimestamp(lts).strftime("%Y-%m-%d %H:%M") if lts else "----"
-            print(f"  {c(name,1)} {c('—',2)} {c(url,36)}  {cnt}  {c(lstr,2)}")
+            print(f"  {c(name,1)} - {c(url,36)}  {cnt}  {c(lstr,2)}")
     return 0
 
 
@@ -2347,6 +2434,15 @@ def cmd_view(args):
         cur = conn.cursor()
         cur.execute("UPDATE items SET read = 1 WHERE id = ?", (item_id,))
         conn.commit()
+    # Optionally star/unstar after viewing (unstar takes precedence if both given)
+    if getattr(args, "unstar", False):
+        cur = conn.cursor()
+        cur.execute("UPDATE items SET starred = 0 WHERE id = ?", (item_id,))
+        conn.commit()
+    elif getattr(args, "star", False):
+        cur = conn.cursor()
+        cur.execute("UPDATE items SET starred = 1 WHERE id = ?", (item_id,))
+        conn.commit()
     return 0
 
 
@@ -2411,6 +2507,14 @@ def cmd_open(args):
         cur = conn.cursor()
         cur.executemany("UPDATE items SET read = 1 WHERE id = ?", [(iid,) for iid in ids])
         conn.commit()
+    if opened:
+        cur = conn.cursor()
+        if getattr(args, "unstar", False):
+            cur.executemany("UPDATE items SET starred = 0 WHERE id = ?", [(iid,) for iid in ids])
+            conn.commit()
+        elif getattr(args, "star", False):
+            cur.executemany("UPDATE items SET starred = 1 WHERE id = ?", [(iid,) for iid in ids])
+            conn.commit()
     if missing:
         print("Missing ids: " + ", ".join(str(i) for i in missing), file=sys.stderr)
     return 0
@@ -2617,7 +2721,7 @@ def cmd_source_rm(args):
     cur.execute("SELECT COUNT(*) FROM items WHERE feed_url = ?", (url,))
     icount = (cur.fetchone() or (0,))[0]
     if not getattr(args, "yes", False):
-        print(f"About to remove source: {name} — {url}")
+        print(f"About to remove source: {name} - {url}")
         print(f"This will delete the feed and {icount} item(s) (ON DELETE CASCADE). Use --yes to confirm.")
         return 0
     # Delete feed row; cascades to items and feed_groups
@@ -2628,7 +2732,7 @@ def cmd_source_rm(args):
             cur.execute("VACUUM")
         except Exception:
             pass
-    print(f"Removed source and cascaded items: {name} — {url}")
+    print(f"Removed source and cascaded items: {name} - {url}")
     return 0
 
 
@@ -2984,7 +3088,12 @@ def export_rows(conn: sqlite3.Connection, rows, dest: str, fmt: str) -> int:
 
 
 def default_fs_dest() -> str:
-    return os.path.join(rssel_home(), "fs")
+    try:
+        cfg = read_config()
+        d = cfg.get("export_dir") or "./fs"
+    except Exception:
+        d = "./fs"
+    return os.path.abspath(d)
 
 
 def expected_item_path(item: dict, fmt: str = "md", dest: str | None = None) -> str:
@@ -4303,7 +4412,7 @@ def cmd_pick(args):
         return (s + " " * extra) if right else (" " * extra + s)
     def _truncate(s: str, w: int) -> str:
         clean = _ansi_strip(s)
-        return clean if len(clean) <= w else (clean[: max(0, w - 1)] + "…")
+        return clean if len(clean) <= w else (clean[: max(0, w - 3)] + "...")
     if grid:
         col_id, col_marks, col_groups = 6, 2, 20
         allowed_meta = {"date", "path", "url", "tags", "source", "snippet", "meta"}
@@ -4523,7 +4632,7 @@ def cmd_pick(args):
 def build_parser():
     p = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Lightweight, self‑contained CLI RSS reader",
+        description="Lightweight, self-contained CLI RSS reader",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=HELP_EPILOG,
     )
@@ -4532,9 +4641,20 @@ def build_parser():
     sp = sub.add_parser("init", help="Create local config, sources, and DB")
     sp.set_defaults(func=cmd_init)
 
-    sp = sub.add_parser("sources", help="Show configured groups and feeds")
+    sp = sub.add_parser(
+        "sources",
+        help="Show configured groups and feeds",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Show configured sources grouped by config groups; optionally include DB info.",
+    )
+    sp.add_argument("--group", "-g", help="Only show this group (comma/space separated)")
     sp.add_argument("--with-db", action="store_true", help="Show DB status: archived flag and current item counts")
     sp.add_argument("--include-db-only", action="store_true", help="When used with --with-db, also list DB-only sources not present in config")
+    sp.add_argument("--json", action="store_true", help="Output sources as JSON (group, title, url, archived, item_count)")
+    sp.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort sources within each group (JSON: global). 'count-*' requires DB info")
+    sp.add_argument("--top", type=int, help="Limit number of sources shown (per group; JSON: global)")
+    sp.add_argument("--color", action="store_true", help="Colorize output")
+    sp.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output")
     sp.set_defaults(func=cmd_sources)
 
     sp = sub.add_parser("fetch", help="Fetch feeds and cache items")
@@ -4636,6 +4756,8 @@ def build_parser():
     sp.add_argument("--raw", action="store_true", help="Show raw HTML instead of plain text")
     sp.add_argument("--mark-read", action="store_true", help="(Legacy) Mark item as read after viewing (default behavior)")
     sp.add_argument("--no-mark-read", action="store_true", help="Do not mark item as read after viewing")
+    sp.add_argument("--star", action="store_true", help="Star the item after viewing")
+    sp.add_argument("--unstar", action="store_true", help="Unstar the item after viewing")
     sp.set_defaults(func=cmd_view)
 
     # 'read' is an alias of 'view'
@@ -4647,6 +4769,8 @@ def build_parser():
     sp = sub.add_parser("open", help="Open item link(s) in system browser", aliases=["o"]) 
     sp.add_argument("ids", type=str, nargs="+", help="Item ID(s) (decimal or base36)")
     sp.add_argument("--mark-read", action="store_true", help="Mark item(s) as read after opening")
+    sp.add_argument("--star", action="store_true", help="Star item(s) after opening")
+    sp.add_argument("--unstar", action="store_true", help="Unstar item(s) after opening")
     sp.set_defaults(func=cmd_open)
 
     # 'o' is a short alias of 'open'
@@ -4668,7 +4792,7 @@ def build_parser():
     sp_files = sub.add_parser("files", help="Work with file-tree exports")
     subf = sp_files.add_subparsers(dest="files_cmd", required=True)
     sp_sync = subf.add_parser("sync", help="Sync items into a directory tree")
-    sp_sync.add_argument("--dest", default=os.path.join(rssel_home(), "fs"), help="Destination directory (default: ./.rssel/fs)")
+    sp_sync.add_argument("--dest", default="./fs", help="Destination directory (default: ./fs)")
     sp_sync.add_argument("--group", "-g", help="Filter by group")
     sp_sync.add_argument("--unread-only", action="store_true", help="Only export unread items")
     sp_sync.add_argument("--limit", "-n", type=int, help="Limit number of items per group")
@@ -4687,7 +4811,7 @@ def build_parser():
     sp_all.add_argument("--color", action="store_true", help="Colorize output lines")
     sp_all.add_argument("--nocolor", action="store_true", help="Force-disable ANSI colors in output")
     sp_all.add_argument("--timeout", type=int, default=15, help="HTTP timeout in seconds (default: 15)")
-    sp_all.add_argument("--dest", default=os.path.join(rssel_home(), "fs"), help="Destination directory (default: ./.rssel/fs)")
+    sp_all.add_argument("--dest", default="./fs", help="Destination directory (default: ./fs)")
     sp_all.add_argument("--format", choices=["md", "txt", "json", "html"], default="md", help="File format for content (default: md)")
     sp_all.add_argument("--unread-only", action="store_true", help="Only export unread items")
     sp_all.add_argument("--limit", "-n", type=int, help="Limit number of items per group")
@@ -4918,7 +5042,7 @@ def build_parser():
         "compact",
         help="One-line compact tag map: tag(count): [ids]; ...",
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Compact one-line tag summary: tag(count): [ids]; …",
+        description="Compact one-line tag summary: tag(count): [ids]; ...",
     )
     tc_filters = sp_cmap.add_argument_group("Filters")
     tc_filters.add_argument("--group", "-g", help="Filter by group")
@@ -5070,7 +5194,12 @@ def build_parser():
     sp_pd.set_defaults(func=lambda a: cmd_purge(argparse.Namespace(deleted=True, before=None, older_days=None, group=a.group, source=a.source, source_id=a.source_id, clean_tags=a.clean_tags, vacuum=a.vacuum, dry_run=a.dry_run)))
 
     # stats: show DB statistics (optionally filtered)
-    sp_stats = sub.add_parser("stats", help="Show database statistics (optionally filtered by group/source/date)")
+    sp_stats = sub.add_parser(
+        "stats",
+        help="Show database statistics (optionally filtered by group/source/date)",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Show feed/item stats with optional filters and top lists.",
+    )
     sp_stats.add_argument("--group", "-g", help="Filter by group(s)")
     sp_stats.add_argument("--source", help="Filter by source (url or numeric id)")
     sp_stats.add_argument("--since", help="Filter items by date/time >=")
@@ -5082,6 +5211,7 @@ def build_parser():
     sp_stats.add_argument("--top", type=int, default=10, help="Top N for tags/sources (default: 10)")
     sp_stats.add_argument("--color", action="store_true", help="Colorize output")
     sp_stats.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output")
+    sp_stats.add_argument("--json", action="store_true", help="Output stats as JSON")
     sp_stats.set_defaults(func=cmd_stats)
 
     return p
