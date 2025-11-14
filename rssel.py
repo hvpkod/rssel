@@ -506,6 +506,16 @@ def init_db(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE items ADD COLUMN deleted INTEGER DEFAULT 0")
     if "created_ts" not in cols:
         cur.execute("ALTER TABLE items ADD COLUMN created_ts INTEGER DEFAULT 0")
+    if "auto_tagged_ts" not in cols:
+        try:
+            cur.execute("ALTER TABLE items ADD COLUMN auto_tagged_ts INTEGER DEFAULT 0")
+        except Exception:
+            pass
+    if "fs_exported_ts" not in cols:
+        try:
+            cur.execute("ALTER TABLE items ADD COLUMN fs_exported_ts INTEGER DEFAULT 0")
+        except Exception:
+            pass
     # Feeds migrations
     cur.execute("PRAGMA table_info(feeds)")
     fcols = {r[1] for r in cur.fetchall()}
@@ -913,6 +923,8 @@ def cmd_fetch(args):
     use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False))
     def c(text, *codes):
         return _maybe(text, use_color, *codes)
+    # Start time
+    print(c("[fetch] start: ", 2) + c(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 2))
     # Validate duplicate URLs in sources
     urls = [e.get("url") for e in entries if e.get("url")]
     seen: dict[str,int] = {}
@@ -1288,22 +1300,15 @@ def cmd_list(args):
             placeholders = ",".join(["?"] * len(tiers))
             where.append(f"COALESCE(feeds.tier,'3') IN ({placeholders})")
             params.extend(tiers)
-    # Filter by source (id or url)
-    src = getattr(args, "source", None)
-    if src:
-        url_val = None
-        try:
-            rid = int(src)
-            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (rid,))
-            row = cur.fetchone()
-            if row:
-                url_val = row[0]
-        except Exception:
-            url_val = None
-        if not url_val:
-            url_val = src
-        where.append("items.feed_url = ?")
-        params.append(url_val)
+    # Filter by source (explicit id or url/numeric string)
+    src_sql, src_params = _build_source_filter(
+        cur,
+        getattr(args, "source", None),
+        getattr(args, "source_id", None),
+    )
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     # multi-tag intersection filter
     if getattr(args, "tags", None):
         # parse comma/space separated tags
@@ -1855,20 +1860,10 @@ def cmd_stats(args):
             where.append(f"EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp IN ({placeholders}))")
             params.extend(glist)
     # Source filter (id or url)
-    if getattr(args, "source", None):
-        src = args.source
-        url_val = None
-        try:
-            rid = int(src)
-            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (rid,))
-            row = cur.fetchone()
-            if row:
-                url_val = row[0]
-        except Exception:
-            url_val = None
-        url_val = url_val or src
-        where.append("items.feed_url = ?")
-        params.append(url_val)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     # Date filters
     ts_field = "items.published_ts" if getattr(args, "date_field", "published") == "published" else "items.created_ts"
     if getattr(args, "on", None):
@@ -2320,7 +2315,6 @@ def replace_item_tags(conn: sqlite3.Connection, item_id: int, tag_names: list[st
         tid = upsert_tag(conn, name)
         if tid is not None:
             cur.execute("INSERT OR IGNORE INTO item_tags(item_id, tag_id) VALUES(?, ?)", (item_id, tid))
-    conn.commit()
 
 
 def get_item_tag_names(conn: sqlite3.Connection, item_id: int) -> list[str]:
@@ -2771,21 +2765,10 @@ def cmd_archive_date(args):
         where.append(f"items.feed_url IN (SELECT url FROM feed_groups WHERE grp IN ({placeholders}))")
         params.extend(glist)
     # Source filter (url or id)
-    src = getattr(args, "source", None)
-    if src:
-        url_val = None
-        try:
-            rid = int(src)
-            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (rid,))
-            row = cur.fetchone()
-            if row:
-                url_val = row[0]
-        except Exception:
-            url_val = None
-        if not url_val:
-            url_val = src
-        where.append("items.feed_url = ?")
-        params.append(url_val)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     # Build final WHERE and include starred protection on archive
     where_sql = " AND ".join(where) if where else "1"
     if args.undo:
@@ -2900,7 +2883,7 @@ def slugify(text: str, max_len: int = 80) -> str:
     return text[:max_len]
 
 
-def iter_items(conn: sqlite3.Connection, group: str | None, unread_only: bool, limit: int | None):
+def iter_items(conn: sqlite3.Connection, group: str | None, unread_only: bool, limit: int | None, pending_only: bool = False):
     cur = conn.cursor()
     where = []
     params: list = []
@@ -2913,11 +2896,13 @@ def iter_items(conn: sqlite3.Connection, group: str | None, unread_only: bool, l
     where.append("items.deleted = 0")
     if unread_only:
         where.append("items.read = 0")
+    if pending_only:
+        where.append("COALESCE(items.fs_exported_ts, 0) = 0")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     limit_sql = f"LIMIT {int(limit)}" if limit else ""
     sql = f"""
         SELECT items.id, items.title, items.summary, items.content, items.link,
-               items.published_ts, feeds.grp, items.feed_url
+               items.published_ts, feeds.grp, items.feed_url, items.fs_exported_ts
         FROM items JOIN feeds ON items.feed_url = feeds.url
         {where_sql}
         ORDER BY items.published_ts DESC, items.id DESC
@@ -2933,6 +2918,7 @@ def iter_items(conn: sqlite3.Connection, group: str | None, unread_only: bool, l
             "published_ts": row[5],
             "group": row[6],
             "feed_url": row[7],
+            "fs_exported_ts": row[8],
         }
 
 
@@ -3134,6 +3120,8 @@ def cmd_sync(args):
     use_color = (bool(getattr(args, "color", False)) or cfg_flag(read_config(), "display_color", False)) and not bool(getattr(args, "nocolor", False))
     def c(text, *codes):
         return _maybe(text, use_color, *codes)
+    # Start time
+    print(c("[sync] start: ", 2) + c(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 2))
     entries = read_sources_entries()
     if not entries:
         print("No sources configured. Run 'rssel init'.", file=sys.stderr)
@@ -3277,6 +3265,8 @@ def cmd_sync(args):
                 placeholders = ",".join(["?"] * len(glist))
                 where.append(f"EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp IN ({placeholders}))")
                 params.extend(glist)
+        if not getattr(args, "retag_all", False):
+            where.append("COALESCE(items.auto_tagged_ts, 0) = 0")
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         sql = f"""
             SELECT items.id, items.title, items.summary, items.content, items.link
@@ -3303,7 +3293,10 @@ def cmd_sync(args):
             seen = set()
             tags = [t for t in tags if not (t in seen or seen.add(t))]
             replace_item_tags(conn, iid, tags)
+            cur.execute("UPDATE items SET auto_tagged_ts = ? WHERE id = ?", (int(time.time()), iid))
             processed += 1
+        if processed:
+            conn.commit()
         print(c("Auto-tagged ", 2) + c(str(processed), 32 if processed > 0 else 33, 1) + c(f" items (max={max_tags}, include_domain={'yes' if include_domain else 'no'})", 2))
 
     # Export step (optional based on config)
@@ -3313,8 +3306,9 @@ def cmd_sync(args):
         ensure_clean_dir(dest, args.clean)
         groups_done: set[str] = set()
         count = 0
+        export_all = bool(getattr(args, "export_all", False) or getattr(args, "clean", False))
         allowed: set[str] | None = set(feed_urls) if (getattr(args, "id", None) is not None or getattr(args, "source", None)) else None
-        for item in iter_items(conn, args.group, args.unread_only, args.limit):
+        for item in iter_items(conn, args.group, args.unread_only, args.limit, pending_only=not export_all):
             if allowed is not None:
                 # Load feed_url for this item to filter; get_item returns feed_url
                 it = get_item(conn, item["id"]) if "feed_url" not in item else None
@@ -3328,7 +3322,10 @@ def cmd_sync(args):
                 groups_done.add(grp)
             tags = get_item_tag_names(conn, item["id"]) if args.format in ("md", "txt", "json", "html") else []
             write_item_file(gdir, item, args.format, tags)
+            cur.execute("UPDATE items SET fs_exported_ts = ? WHERE id = ?", (int(time.time()), item["id"]))
             count += 1
+        if count:
+            conn.commit()
         print(c("Exported ", 2) + c(str(count), 36) + c(" items to ", 2) + c(dest, 32) + c(f" (format: {args.format})", 2))
     else:
         print(c("Export step disabled by config (sync_write_files=false). Use --write-file to force.", 33))
@@ -3348,20 +3345,10 @@ def cmd_cold(args):
         where.append(f"items.feed_url IN (SELECT url FROM feed_groups WHERE grp IN ({placeholders}))")
         params.extend(glist)
     # source filter (id or url)
-    src = getattr(args, "source", None)
-    if src:
-        url_val = None
-        try:
-            rid = int(src)
-            cur.execute("SELECT url FROM feeds WHERE rowid = ?", (rid,))
-            row = cur.fetchone()
-            if row:
-                url_val = row[0]
-        except Exception:
-            url_val = None
-        url_val = url_val or src
-        where.append("items.feed_url = ?")
-        params.append(url_val)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
     # tag intersection filter
     if getattr(args, "tags", None):
         tag_list = [t.strip().lower() for t in re.split(r"[,\s]+", args.tags) if t.strip()]
@@ -3521,6 +3508,8 @@ def cmd_tags_auto(args):
     if args.group:
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
+    if not getattr(args, "retag_all", False):
+        where.append("COALESCE(items.auto_tagged_ts, 0) = 0")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     limit_sql = f"LIMIT {int(args.limit)}" if args.limit else ""
     sql = f"""
@@ -3553,9 +3542,12 @@ def cmd_tags_auto(args):
             print(f"{iid:6d}  " + ", ".join(tags))
         else:
             replace_item_tags(conn, iid, tags)
+            cur.execute("UPDATE items SET auto_tagged_ts = ? WHERE id = ?", (int(time.time()), iid))
         processed += 1
+    if not args.dry_run and processed:
+        conn.commit()
     if not args.dry_run:
-        print(f"Auto-tagged {processed} items")
+        print(f"Auto-tagged {processed} item(s)")
     return 0
 
 
@@ -3570,7 +3562,7 @@ def cmd_tags_list(args):
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
     # Optional source filter (url or numeric id)
-    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
     if src_sql:
         where.append(src_sql)
         params.extend(src_params)
@@ -3642,7 +3634,7 @@ def cmd_tags_items(args):
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
     # Optional source filter (url or numeric id)
-    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
     if src_sql:
         where.append(src_sql)
         params.extend(src_params)
@@ -3720,7 +3712,7 @@ def cmd_tags_map(args):
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
     # Optional source filter (url or numeric id)
-    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
     if src_sql:
         where.append(src_sql)
         params.extend(src_params)
@@ -3943,7 +3935,7 @@ def cmd_tags_compact(args):
         where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
         params.append(args.group)
     # Optional source filter (url or numeric id)
-    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None))
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
     if src_sql:
         where.append(src_sql)
         params.extend(src_params)
@@ -4277,6 +4269,10 @@ def cmd_pick(args):
                     f")"
                 )
                 params.extend(tag_list)
+        src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
+        if src_sql:
+            where.append(src_sql)
+            params.extend(src_params)
         if args.unread_only:
             where.append("items.read = 0")
         elif getattr(args, "read_only", False):
@@ -4696,7 +4692,7 @@ def build_parser():
     sp.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
     sp.add_argument("--source", help="Filter by a source (url or numeric id)")
-    sp.add_argument("--source-id", type=int, help="Filter by a source (numeric id)")
+    sp.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source (numeric id) (alias: --id)")
     sp.add_argument("--sources", action="store_true", help="List sources summary (ids, names, urls, counts)")
     sp.add_argument("--list-sources", action="store_true", help="Alias: list sources summary (ids, names, urls, counts)")
     sp.add_argument("--list-tags", action="store_true", help="List all tags with counts (optional: filter by --group)")
@@ -4820,8 +4816,10 @@ def build_parser():
     sp_all.add_argument("--no-auto-tags", dest="auto_tags", action="store_false", help="Disable auto-tagging before export")
     sp_all.add_argument("--max-tags", type=int, default=5, help="Max tags per item when auto-tagging (default: 5)")
     sp_all.add_argument("--include-domain", action="store_true", help="Include site domain as a tag during auto-tagging")
+    sp_all.add_argument("--retag-all", action="store_true", help="Re-run auto-tagging for all matching items during this sync")
     # Export toggle override
     sp_all.add_argument("--write-file", action="store_true", help="Override config (sync_write_files) and write files in the export step")
+    sp_all.add_argument("--export-all", action="store_true", help="Export all matching items even if they were written before")
     sp_all.set_defaults(auto_tags=True)
     sp_all.set_defaults(func=cmd_sync)
 
@@ -4848,6 +4846,7 @@ def build_parser():
     sp_cold.add_argument("--on", help="Filter items on a specific day (YYYY-MM-DD or 'today')")
     sp_cold.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
     sp_cold.add_argument("--source", help="Filter by a source (url or numeric id)")
+    sp_cold.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
     sp_cold.add_argument("--highlight", action="store_true", help="Enable highlight evaluation (paired with --highlight-only)")
     sp_cold.add_argument("--highlight-only", action="store_true", help="Only include items that match the highlight word list")
     sp_cold.set_defaults(func=cmd_cold)
@@ -4869,6 +4868,8 @@ def build_parser():
     sp_pick.add_argument("--group", "-g", help="Filter by group")
     sp_pick.add_argument("--tier", "-t", help="Filter by feed tier(s) 1-5 (comma/space)")
     sp_pick.add_argument("--tags", help="Comma/space separated tag names; item must have ALL")
+    sp_pick.add_argument("--source", help="Filter by a source (url or numeric id)")
+    sp_pick.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
     sp_pick.add_argument("--unread-only", action="store_true", help="Only include unread items")
     sp_pick.add_argument("--read", dest="read_only", action="store_true", help="Only include read items")
     sp_pick.add_argument("--star", dest="star_only", action="store_true", help="Only include starred (favorite) items")
@@ -4970,6 +4971,7 @@ def build_parser():
     sp_auto.add_argument("--limit", "-n", type=int, help="Limit number of items")
     sp_auto.add_argument("--max-tags", type=int, default=5, help="Max tags per item (default: 5)")
     sp_auto.add_argument("--include-domain", action="store_true", help="Include site domain as a tag")
+    sp_auto.add_argument("--retag-all", action="store_true", help="Re-run auto-tagging for all matching items (not just new ones)")
     sp_auto.add_argument("--dry-run", action="store_true", help="Show tags but do not save")
     sp_auto.set_defaults(func=cmd_tags_auto)
 
@@ -4982,6 +4984,7 @@ def build_parser():
     tl_filters = sp_listtags.add_argument_group("Filters")
     tl_filters.add_argument("--group", "-g", help="Filter by group")
     tl_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    tl_filters.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
     tl_sort = sp_listtags.add_argument_group("Sorting")
     tl_sort.add_argument("--sort", choices=["name","count-asc","count-desc"], help="Sort order (default: count-desc)")
     tl_sort.add_argument("--top", type=int, help="Limit number of tags shown")
@@ -4999,6 +5002,7 @@ def build_parser():
     ti_filters.add_argument("--tag", required=True, help="Tag name (case-insensitive). Comma/space separated for ALL-match (e.g. 'us, trump')")
     ti_filters.add_argument("--group", "-g", help="Filter by group")
     ti_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    ti_filters.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
     ti_filters.add_argument("--limit", "-n", type=int, help="Limit items")
     ti_filters.add_argument("--unread-only", action="store_true", help="Only unread items")
     ti_disp = sp_items.add_argument_group("Display")
@@ -5023,6 +5027,7 @@ def build_parser():
     tm_filters = sp_map.add_argument_group("Filters")
     tm_filters.add_argument("--group", "-g", help="Filter by group")
     tm_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    tm_filters.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
     tm_limits = sp_map.add_argument_group("Limits")
     tm_limits.add_argument("--top", type=int, help="Show only the top N tags by count")
     tm_limits.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
@@ -5047,6 +5052,7 @@ def build_parser():
     tc_filters = sp_cmap.add_argument_group("Filters")
     tc_filters.add_argument("--group", "-g", help="Filter by group")
     tc_filters.add_argument("--source", help="Filter by a source (url or numeric id)")
+    tc_filters.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
     tc_limits = sp_cmap.add_argument_group("Limits")
     tc_limits.add_argument("--top", type=int, help="Show only the top N tags by count")
     tc_limits.add_argument("--min-count", type=int, help="Only include tags with at least this many items")
@@ -5094,6 +5100,7 @@ def build_parser():
     sp_ad.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use (default: published)")
     sp_ad.add_argument("--group", "-g", help="Filter by group(s), comma/space separated (OR)")
     sp_ad.add_argument("--source", help="Filter by source (url or numeric id)")
+    sp_ad.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by source id (alias: --id)")
     sp_ad.add_argument("--undo", action="store_true", help="Unarchive (restore) instead of archive")
     sp_ad.set_defaults(func=cmd_archive_date)
 
@@ -5121,7 +5128,7 @@ def build_parser():
     sp_purge.add_argument("--older-days", type=int, help="Also remove read, non-starred items older than N days")
     sp_purge.add_argument("--group", "-g", help="Restrict purge to group(s) (comma/space separated)")
     sp_purge.add_argument("--source", help="Restrict purge to a source (url or numeric id)")
-    sp_purge.add_argument("--source-id", type=int, help="Restrict purge to a source by numeric id (explicit)")
+    sp_purge.add_argument("--source-id", "--id", dest="source_id", type=int, help="Restrict purge to a source by numeric id (alias: --id)")
     sp_purge.add_argument("--clean-tags", action="store_true", help="Remove tags that no longer have any items")
     sp_purge.add_argument("--vacuum", action="store_true", help="VACUUM the database to reclaim disk space")
     sp_purge.add_argument("--dry-run", action="store_true", help="Show what would be removed without deleting")
@@ -5131,7 +5138,7 @@ def build_parser():
     sp_pdel = sub.add_parser("purge-deleted", help="Shortcut: purge deleted items (optional: scope and cleanup)")
     sp_pdel.add_argument("--group", "-g", help="Restrict to group(s)")
     sp_pdel.add_argument("--source", help="Restrict to a source (url or numeric id)")
-    sp_pdel.add_argument("--source-id", type=int, help="Restrict to a source by numeric id")
+    sp_pdel.add_argument("--source-id", "--id", dest="source_id", type=int, help="Restrict to a source by numeric id (alias: --id)")
     sp_pdel.add_argument("--clean-tags", action="store_true")
     sp_pdel.add_argument("--vacuum", action="store_true")
     sp_pdel.add_argument("--dry-run", action="store_true")
@@ -5187,7 +5194,7 @@ def build_parser():
     sp_pd = sub.add_parser("pd", help="Alias: purge deleted items (optional: scope and cleanup)")
     sp_pd.add_argument("--group", "-g")
     sp_pd.add_argument("--source")
-    sp_pd.add_argument("--source-id", type=int)
+    sp_pd.add_argument("--source-id", "--id", dest="source_id", type=int, help="Restrict to a source by numeric id (alias: --id)")
     sp_pd.add_argument("--clean-tags", action="store_true")
     sp_pd.add_argument("--vacuum", action="store_true")
     sp_pd.add_argument("--dry-run", action="store_true")
@@ -5202,6 +5209,7 @@ def build_parser():
     )
     sp_stats.add_argument("--group", "-g", help="Filter by group(s)")
     sp_stats.add_argument("--source", help="Filter by source (url or numeric id)")
+    sp_stats.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by source id (alias: --id)")
     sp_stats.add_argument("--since", help="Filter items by date/time >=")
     sp_stats.add_argument("--until", help="Filter items by date/time < (exclusive)")
     sp_stats.add_argument("--from", dest="since", help="Alias for --since")
