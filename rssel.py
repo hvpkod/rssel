@@ -472,6 +472,8 @@ def init_db(conn: sqlite3.Connection):
             content TEXT,
             published_ts INTEGER,
             read INTEGER DEFAULT 0,
+            highlighted INTEGER DEFAULT 0,
+            highlight_updated_ts INTEGER DEFAULT 0,
             UNIQUE(feed_url, guid) ON CONFLICT IGNORE,
             FOREIGN KEY(feed_url) REFERENCES feeds(url) ON DELETE CASCADE
         );
@@ -516,6 +518,20 @@ def init_db(conn: sqlite3.Connection):
             cur.execute("ALTER TABLE items ADD COLUMN fs_exported_ts INTEGER DEFAULT 0")
         except Exception:
             pass
+    if "highlighted" not in cols:
+        try:
+            cur.execute("ALTER TABLE items ADD COLUMN highlighted INTEGER DEFAULT 0")
+        except Exception:
+            pass
+    if "highlight_updated_ts" not in cols:
+        try:
+            cur.execute("ALTER TABLE items ADD COLUMN highlight_updated_ts INTEGER DEFAULT 0")
+        except Exception:
+            pass
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_items_highlighted ON items(highlighted)")
+    except Exception:
+        pass
     # Feeds migrations
     cur.execute("PRAGMA table_info(feeds)")
     fcols = {r[1] for r in cur.fetchall()}
@@ -618,6 +634,11 @@ def cmd_init(args):
 
     conn = db_conn()
     init_db(conn)
+    highlight_terms = load_highlight_words()
+    highlight_terms = load_highlight_words()
+    highlight_terms = load_highlight_words()
+    highlight_terms = load_highlight_words()
+    highlight_terms = load_highlight_words()
     conn.close()
     print("Database ready")
 
@@ -1365,6 +1386,9 @@ def cmd_list(args):
         where.append("items.read = 1")
     if getattr(args, "star_only", False):
         where.append("items.starred = 1")
+    highlight_only = getattr(args, "highlight_only", False)
+    if highlight_only:
+        where.append("items.highlighted = 1")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     # Effective limit: CLI --limit or config list_max
     eff_limit = None
@@ -1390,20 +1414,18 @@ def cmd_list(args):
     else:  # default or --sort-date-new
         order_by = f"{ts_field} DESC, items.id DESC"
     sql = f"""
-        SELECT items.id, {ts_field} AS ts, items.read, feeds.grp, items.title, items.feed_url
+        SELECT items.id, {ts_field} AS ts, items.read, feeds.grp, items.title, items.feed_url, COALESCE(items.highlighted, 0) AS highlighted
         FROM items JOIN feeds ON items.feed_url = feeds.url
         {where_sql}
         ORDER BY {order_by}
         {limit_sql}
     """
     cur.execute(sql, params)
-    rows = cur.fetchall()
+    raw_rows = cur.fetchall()
+    highlight_map: dict[int, bool] = {int(iid): bool(hval) for (iid, ts, read, grp, title, feed_url, hval) in raw_rows}
+    rows = [(iid, ts, read, grp, title, feed_url) for (iid, ts, read, grp, title, feed_url, _h) in raw_rows]
     # opts already computed above
-    # Optional highlight support
-    hl_terms: list[str] = []
-    do_highlight = getattr(args, "highlight", False) or getattr(args, "highlight_only", False)
-    if do_highlight:
-        hl_terms = load_highlight_words()
+    do_highlight = getattr(args, "highlight", False) or highlight_only
     # Optional export
     if getattr(args, "export", False) and rows:
         cfg = read_config()
@@ -1417,28 +1439,10 @@ def cmd_list(args):
         cur_groups = conn.cursor()
         src_name_cache: dict[str, str] = {}
         for (iid, ts, read, grp, title, feed_url) in rows:
-            # Highlight filter (optional)
-            is_hl = False
-            if do_highlight and hl_terms:
-                item_for_hl = get_item(conn, iid)
-                title_hl = (item_for_hl.get("title") if item_for_hl else title) or ""
-                body_hl = html_to_text((item_for_hl.get("content") if item_for_hl else None) or (item_for_hl.get("summary") if item_for_hl else None) or "")
-                low = (title_hl + "\n" + body_hl).lower()
-                is_hl = False
-                for term in hl_terms:
-                    t = term.strip()
-                    if not t:
-                        continue
-                    if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
-                        if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
-                            is_hl = True
-                            break
-                    else:
-                        if t.lower() in low:
-                            is_hl = True
-                            break
-                if getattr(args, "highlight_only", False) and not is_hl:
-                    continue
+            # Highlight filter (optional; already applied in SQL but double-check)
+            is_hl = bool(highlight_map.get(int(iid), False))
+            if highlight_only and not is_hl:
+                continue
             # groups
             try:
                 cur_groups.execute("SELECT grp FROM feed_groups WHERE url = ? ORDER BY grp", (feed_url,))
@@ -1548,25 +1552,8 @@ def cmd_list(args):
     def _process_row(iid, ts, read, grp, title, feed_url):
         nonlocal shown_count, opts
         # Evaluate highlight state if requested
-        is_hl = False
-        if do_highlight and hl_terms:
-            item_for_hl = get_item(conn, iid)
-            title_hl = (item_for_hl.get("title") if item_for_hl else title) or ""
-            body_hl = html_to_text((item_for_hl.get("content") if item_for_hl else None) or (item_for_hl.get("summary") if item_for_hl else None) or "")
-            low = (title_hl + "\n" + body_hl).lower()
-            for term in hl_terms:
-                t = term.strip()
-                if not t:
-                    continue
-                if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
-                    if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
-                        is_hl = True
-                        break
-                else:
-                    if t.lower() in low:
-                        is_hl = True
-                        break
-        if getattr(args, "highlight_only", False) and not is_hl:
+        is_hl = bool(highlight_map.get(int(iid), False)) if do_highlight else False
+        if highlight_only and not is_hl:
             return
         mark = " " if read else "*"
         hmark = "!" if is_hl else " "
@@ -2266,6 +2253,26 @@ def load_highlight_words() -> list[str]:
         except Exception:
             pass
     return words
+
+
+def matches_highlight_terms(title: str | None, summary: str | None, content: str | None, terms: list[str]) -> bool:
+    if not terms:
+        return False
+    ttl = (title or "").lower()
+    body_src = content if content else summary
+    body = html_to_text(body_src or "")
+    low = (ttl + "\n" + body).lower()
+    for raw in terms:
+        term = raw.strip()
+        if not term:
+            continue
+        if re.fullmatch(r"[\w\-]+", term, flags=re.UNICODE):
+            if re.search(rf"\b{re.escape(term)}\b", low, flags=re.IGNORECASE):
+                return True
+        else:
+            if term.lower() in low:
+                return True
+    return False
 
 
 def _tokenize(text: str) -> list[str]:
@@ -3128,6 +3135,7 @@ def cmd_sync(args):
         return 1
     conn = db_conn()
     init_db(conn)
+    highlight_terms = load_highlight_words()
     if getattr(args, "id", None) is not None or getattr(args, "ids", None) or getattr(args, "source", None):
         upsert_feeds(conn, entries, None)
     else:
@@ -3224,6 +3232,14 @@ def cmd_sync(args):
                     now_ts,
                 ),
             )
+            if cur.rowcount:
+                iid = cur.lastrowid
+                if iid:
+                    is_hl = matches_highlight_terms(it.get("title"), it.get("summary"), it.get("content"), highlight_terms)
+                    cur.execute(
+                        "UPDATE items SET highlighted = ?, highlight_updated_ts = ? WHERE id = ?",
+                        (1 if is_hl else 0, now_ts, iid),
+                    )
         conn.commit()
         if before_count is not None:
             try:
@@ -3369,6 +3385,8 @@ def cmd_cold(args):
         where.append("items.read = 0")
     if getattr(args, "star_only", False):
         where.append("items.starred = 1")
+    if getattr(args, "highlight_only", False):
+        where.append("items.highlighted = 1")
     # new window
     if getattr(args, "new", False):
         cfg = read_config()
@@ -3415,35 +3433,7 @@ def cmd_cold(args):
     """
     cur.execute(sql, params)
     rows = cur.fetchall()
-    # Optional highlight-only filter
-    hl_terms: list[str] = []
-    do_only_hl = getattr(args, "highlight_only", False)
-    if do_only_hl or getattr(args, "highlight", False):
-        hl_terms = load_highlight_words()
-    selected_rows = []
-    if do_only_hl and hl_terms:
-        for (iid, ts, read, grp, title, feed_url) in rows:
-            item = get_item(conn, iid)
-            title_hl = (item.get("title") if item else title) or ""
-            body_hl = html_to_text((item.get("content") if item else None) or (item.get("summary") if item else None) or "")
-            low = (title_hl + "\n" + body_hl).lower()
-            is_hl = False
-            for term in hl_terms:
-                t = term.strip()
-                if not t:
-                    continue
-                if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
-                    if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
-                        is_hl = True
-                        break
-                else:
-                    if t.lower() in low:
-                        is_hl = True
-                        break
-            if is_hl:
-                selected_rows.append((iid, ts, read, grp, title, feed_url))
-    else:
-        selected_rows = rows
+    selected_rows = rows
     # Prepare tar
     out_path = args.output
     gzip = not getattr(args, "no_gzip", False)
@@ -3496,9 +3486,64 @@ def cmd_cold(args):
     return 0
 
 
+def cmd_highlight_update(args):
+    conn = db_conn()
+    init_db(conn)
+    cur = conn.cursor()
+    terms = load_highlight_words()
+    if not terms:
+        print("No highlight words configured; proceeding with empty list.", file=sys.stderr)
+    where = ["items.deleted = 0"]
+    params: list = []
+    if getattr(args, "group", None):
+        where.append("EXISTS (SELECT 1 FROM feed_groups fg WHERE fg.url = items.feed_url AND fg.grp = ?)")
+        params.append(args.group)
+    src_sql, src_params = _build_source_filter(cur, getattr(args, "source", None), getattr(args, "source_id", None))
+    if src_sql:
+        where.append(src_sql)
+        params.extend(src_params)
+    if getattr(args, "only_missing", False):
+        where.append("COALESCE(items.highlight_updated_ts, 0) = 0")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    limit_sql = f"LIMIT {int(args.limit)}" if getattr(args, "limit", None) else ""
+    sql = f"""
+        SELECT items.id, items.title, items.summary, items.content, COALESCE(items.highlighted, 0) AS highlighted
+        FROM items JOIN feeds ON items.feed_url = feeds.url
+        {where_sql}
+        ORDER BY items.published_ts DESC, items.id DESC
+        {limit_sql}
+    """
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    if not rows:
+        print("No matching items.")
+        return 0
+    now_ts = int(time.time())
+    updated = 0
+    for (iid, title, summary, content, cur_flag) in rows:
+        new_flag = matches_highlight_terms(title, summary, content, terms)
+        if getattr(args, "dry_run", False):
+            marker = "HL" if new_flag else "--"
+            print(f"{iid:6d} {marker} {title or ''}")
+            continue
+        if bool(cur_flag) != new_flag:
+            cur.execute(
+                "UPDATE items SET highlighted = ?, highlight_updated_ts = ? WHERE id = ?",
+                (1 if new_flag else 0, now_ts, iid),
+            )
+            updated += 1
+    if not getattr(args, "dry_run", False) and updated:
+        conn.commit()
+    if getattr(args, "dry_run", False):
+        print(f"Dry-run complete for {len(rows)} item(s)")
+    else:
+        print(f"Updated highlight flags for {updated} of {len(rows)} item(s)")
+    return 0
+
+
 # ---------------- Tagging commands ---------------- #
 
-def cmd_tags_auto(args):
+def cmd_tags_update(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
@@ -3547,7 +3592,7 @@ def cmd_tags_auto(args):
     if not args.dry_run and processed:
         conn.commit()
     if not args.dry_run:
-        print(f"Auto-tagged {processed} item(s)")
+        print(f"Updated tags for {processed} item(s)")
     return 0
 
 
@@ -4279,6 +4324,8 @@ def cmd_pick(args):
             where.append("items.read = 1")
         if getattr(args, "star_only", False):
             where.append("items.starred = 1")
+        if getattr(args, "highlight_only", False):
+            where.append("items.highlighted = 1")
         if getattr(args, "new", False):
             cfg = read_config()
             try:
@@ -4335,7 +4382,7 @@ def cmd_pick(args):
         else:
             order_by = f"{ts_field} DESC, items.id DESC"
         sql = f"""
-            SELECT items.id, {ts_field} AS ts, items.read, feeds.grp, items.title, items.feed_url
+            SELECT items.id, {ts_field} AS ts, items.read, feeds.grp, items.title, items.feed_url, COALESCE(items.highlighted, 0) AS highlighted
             FROM items JOIN feeds ON items.feed_url = feeds.url
             {where_sql}
             ORDER BY {order_by}
@@ -4344,10 +4391,12 @@ def cmd_pick(args):
         cur.execute(sql, params)
         return cur.fetchall()
 
-    rows = build_rows(args.query)
-    if not rows:
+    raw_rows = build_rows(args.query)
+    if not raw_rows:
         print("No items.")
         return 0
+    highlight_map: dict[int, bool] = {int(iid): bool(h) for (iid, ts, read, grp, title, feed_url, h) in raw_rows}
+    rows = [(iid, ts, read, grp, title, feed_url) for (iid, ts, read, grp, title, feed_url, _h) in raw_rows]
     use_fzf = (not args.no_fzf) and bool(detect_fzf())
     if use_fzf:
         # Let user filter interactively; capture the query and re-run DB with it
@@ -4417,32 +4466,13 @@ def cmd_pick(args):
         meta_rows = [m for m in meta_rows if m in allowed_meta]
         source_cache: dict[str, str] = {}
 
-    # Highlight
-    hl_terms: list[str] = []
-    do_highlight = getattr(args, "highlight", False) or getattr(args, "highlight_only", False)
-    if do_highlight:
-        hl_terms = load_highlight_words()
+    # Highlight display uses stored flag
+    highlight_only = getattr(args, "highlight_only", False)
+    do_highlight = getattr(args, "highlight", False) or highlight_only
 
     def print_row(iid, ts, read, grp, title, feed_url):
-        is_hl = False
-        if do_highlight and hl_terms:
-            it = get_item(conn, iid)
-            ttl = (it.get("title") if it else title) or ""
-            body = html_to_text((it or {}).get("content") or (it or {}).get("summary") or "")
-            low = (ttl + "\n" + body).lower()
-            for term in hl_terms:
-                t = term.strip()
-                if not t:
-                    continue
-                if re.fullmatch(r"[\w\-]+", t, flags=re.UNICODE):
-                    if re.search(rf"\b{re.escape(t)}\b", low, flags=re.IGNORECASE):
-                        is_hl = True
-                        break
-                else:
-                    if t.lower() in low:
-                        is_hl = True
-                        break
-        if getattr(args, "highlight_only", False) and not is_hl:
+        is_hl = bool(highlight_map.get(int(iid), False)) if do_highlight else False
+        if highlight_only and not is_hl:
             return False
         mark = " " if read else "*"
         hmark = "!" if is_hl else " "
@@ -4847,9 +4877,26 @@ def build_parser():
     sp_cold.add_argument("--date-field", choices=["published", "created"], default="published", help="Which timestamp to use for date filters (default: published)")
     sp_cold.add_argument("--source", help="Filter by a source (url or numeric id)")
     sp_cold.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
-    sp_cold.add_argument("--highlight", action="store_true", help="Enable highlight evaluation (paired with --highlight-only)")
+    sp_cold.add_argument("--highlight", action="store_true", help="(Deprecated) stored highlight flag is always used; --highlight-only filters highlighted items")
     sp_cold.add_argument("--highlight-only", action="store_true", help="Only include items that match the highlight word list")
     sp_cold.set_defaults(func=cmd_cold)
+
+    # highlight utilities
+    sp_high = sub.add_parser("highlight", help="Highlight maintenance commands")
+    sh = sp_high.add_subparsers(dest="highlight_cmd", required=True)
+    sp_hup = sh.add_parser(
+        "update",
+        help="Recompute highlight flags for items based on highlight_words_file",
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Scan items and update the stored highlighted flag using the configured highlight words.",
+    )
+    sp_hup.add_argument("--group", "-g", help="Only process items from this group")
+    sp_hup.add_argument("--source", help="Filter by a source (url or numeric id)")
+    sp_hup.add_argument("--source-id", "--id", dest="source_id", type=int, help="Filter by a source id (alias: --id)")
+    sp_hup.add_argument("--limit", "-n", type=int, help="Limit number of items to process")
+    sp_hup.add_argument("--only-missing", action="store_true", help="Only process items that were never highlight-scanned")
+    sp_hup.add_argument("--dry-run", action="store_true", help="Show which items would be updated without writing changes")
+    sp_hup.set_defaults(func=cmd_highlight_update)
 
     # pick: fuzzy filter; outputs like list using show flags
     PICK_DESC = (
@@ -4966,14 +5013,14 @@ def build_parser():
     # tags: auto-generate and list
     sp_tags = sub.add_parser("tags", help="Tagging utilities")
     subt = sp_tags.add_subparsers(dest="tags_cmd", required=True)
-    sp_auto = subt.add_parser("auto", help="Auto-generate tags for items")
+    sp_auto = subt.add_parser("update", help="Auto-update tags for items using heuristics")
     sp_auto.add_argument("--group", "-g", help="Only process this group")
     sp_auto.add_argument("--limit", "-n", type=int, help="Limit number of items")
     sp_auto.add_argument("--max-tags", type=int, default=5, help="Max tags per item (default: 5)")
     sp_auto.add_argument("--include-domain", action="store_true", help="Include site domain as a tag")
-    sp_auto.add_argument("--retag-all", action="store_true", help="Re-run auto-tagging for all matching items (not just new ones)")
+    sp_auto.add_argument("--retag-all", action="store_true", help="Re-run tagging for all matching items (not just new ones)")
     sp_auto.add_argument("--dry-run", action="store_true", help="Show tags but do not save")
-    sp_auto.set_defaults(func=cmd_tags_auto)
+    sp_auto.set_defaults(func=cmd_tags_update)
 
     sp_listtags = subt.add_parser(
         "list",
