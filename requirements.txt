@@ -1,0 +1,2 @@
+# No external Python dependencies; stdlib only.
+# Left intentionally empty.

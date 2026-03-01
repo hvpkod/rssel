@@ -1,7 +1,7 @@
 # rssel config (self-contained)
 # Paths are relative to the project folder by default
 data_dir = "./.rssel"
-sources_file = "./.rssel/sources.toml"
+sources_file = "./.rssel/sources.json"
 stopwords_file = "./.rssel/stopwords.txt"
 
 # Sync auto-tagging defaults
@@ -9,13 +9,23 @@ sync_auto_tags = "true"
 sync_max_tags = "5"
 sync_include_domain = "false"
 
+# Sync export (write files)
+# If false, sync will fetch and tag but skip writing files.
+# Override per-run with --write-file.
+sync_write_files = "true"
+
 # Display defaults ("true"/"false")
 display_color = "true"
 display_show_url = "false"
-display_show_tags = "true"
+display_show_tags = "false"
 display_show_path = "false"
 display_show_date = "false"
 display_show_snippet = "false"
+display_show_code = "true"
+display_grid = "false"
+display_json = "false"
+display_highlight = "true"
+display_highlight_only = "false"
 display_snippet_len = "240"
 
 # Internal file-tree export (list/pick/pick-tags --export and sync)
@@ -29,6 +39,16 @@ external_export_format = "md"
 # list --new window (hours)
 new_hours = "24"
 
+# list default max items (used when --limit not set)
+list_max = "2000"
+
+# Tiered fetch intervals (hours); 1 = highest frequency, 5 = lowest
+fetch_tier1_hours = "1"
+fetch_tier2_hours = "3"
+fetch_tier3_hours = "6"
+fetch_tier4_hours = "12"
+fetch_tier5_hours = "24"
+
 # copy defaults
 # part: url|title|summary|content
 copy_default_part = "url"
@@ -41,3 +61,7 @@ copy_separator = "\n"
 editor = "nvim"
 # Clipboard command (auto-detects wl-copy/xclip/xsel/pbcopy if empty)
 clipboard_cmd = ""
+
+# Highlight
+# Path to a newline-separated word/phrase list for highlighting
+highlight_words_file = "./.rssel/highlights.txt"

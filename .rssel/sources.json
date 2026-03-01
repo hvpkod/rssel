@@ -1,18 +1,12 @@
 {
   "sources": [
     {
-      "title": "This Week in Rust",
-      "url": "https://this-week-in-rust.org/rss.xml",
-      "groups": [
-        "tech"
-      ]
-    },
-    {
       "title": "The Guardian World",
       "url": "https://www.theguardian.com/world/rss",
       "groups": [
         "news"
-      ]
+      ],
+      "tier": 3
     },
     {
       "title": "Chris Skinner",
@@ -20,8 +14,286 @@
       "groups": [
         "idea",
         "finance"
-      ]
+      ],
+      "tier": 5
+    },
+    {
+      "title": "SVT Nyheter",
+      "url": "https://www.svt.se/rss.xml",
+      "groups": [
+        "news",
+        "sweden",
+        "prio"
+      ],
+      "tier": 1
+    },
+    {
+      "title": "Hacker News: Front Page",
+      "url": "https://hnrss.org/frontpage",
+      "groups": [
+        "tech"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "Flashback Forum - Meta",
+      "url": "https://www.flashback.org/external.php?type=rss2&forumids=217",
+      "groups": [
+        "flashback"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "Flashback Forum - Krim",
+      "url": "https://www.flashback.org/external.php?type=rss2&forumids=249",
+      "groups": [
+        "flashback"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "Flashback Forum - Security",
+      "url": "https://www.flashback.org/external.php?type=rss2&forumids=16",
+      "groups": [
+        "flashback"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "Dagens Nyheter – Sverige",
+      "url": "https://www.dn.se/rss",
+      "groups": [
+        "swedish",
+        "news"
+      ],
+      "tier": 2
+    },
+    {
+      "title": "Finextra – FinTech & Banking Technology",
+      "url": "https://www.finextra.com/rss/headlines.aspx",
+      "groups": [
+        "fintech",
+        "banking",
+        "payment"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "The Paypers – Payments, FinTech & Banking",
+      "url": "https://thepaypers.com/rss-feeds",
+      "groups": [
+        "payment",
+        "fintech",
+        "banking"
+      ],
+      "tier": 5,
+      "note": "Likely RSS index page; replace with a specific feed URL."
+    },
+    {
+      "title": "Manchester United – Official RSS Feeds",
+      "url": "http://otp.investis.com/clients/us/manchester_united/usn/us-rss-feed.aspx",
+      "groups": [
+        "Manchester United",
+        "sports"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "BookBrowse – Book recommendations & reviews",
+      "url": "https://www.bookbrowse.com/rss/",
+      "groups": [
+        "books",
+        "stuff",
+        "learning"
+      ],
+      "tier": 4,
+      "note": "May be an index of feeds; pick a concrete feed endpoint if needed."
+    },
+    {
+      "title": "TechRepublic – Technology News & Analysis",
+      "url": "https://www.techrepublic.com/rssfeeds/articles/",
+      "groups": [
+        "tech scene",
+        "learning",
+        "productivity"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "Banking Industry Today – Banking News",
+      "url": "https://banking.einnews.com/all_rss",
+      "groups": [
+        "banking",
+        "fintech",
+        "payment"
+      ],
+      "tier": 5
+    },
+    {
+      "title": "Central Banking – CBDC, RegTech, Fintech",
+      "url": "https://www.centralbanking.com/rss-feeds",
+      "groups": [
+        "banking",
+        "fintech",
+        "payment"
+      ],
+      "tier": 5,
+      "note": "Likely RSS index page; replace with a specific feed URL."
+    },
+    {
+      "title": "PFF – Fantasy Football & NFL Draft RSS Feeds",
+      "url": "https://www.pff.com/feed",
+      "groups": [
+        "NFL"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "brians notes",
+      "url": "https://www.briansnotes.io/feed",
+      "groups": [
+        "books",
+        "software",
+        "blog"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "To Summarise",
+      "url": "https://www.tosummarise.com/feed",
+      "groups": [
+        "books"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "Mozilla Hacks – the Web developer blog",
+      "url": "https://hacks.mozilla.org/feed/",
+      "groups": [
+        "tech"
+      ],
+      "tier": 5
+    },
+    {
+      "title": "Slashdot",
+      "url": "https://rss.slashdot.org/Slashdot/slashdotMain",
+      "groups": [
+        "tech",
+        "news"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "GlobeNewswire - News from Sweden",
+      "url": "https://www.globenewswire.com/RssFeed/country/Sweden/feedTitle/GlobeNewswire%20-%20News%20from%20Sweden",
+      "groups": [
+        "news"
+      ],
+      "tier": 5
+    },
+    {
+      "title": "All Financial Services & Investing",
+      "url": "https://www.prnewswire.com/apac/rss/financial-services-latest-news/financial-services-latest-news-list.rss",
+      "groups": [
+        "news",
+        "fintech"
+      ],
+      "tier": 5
+    },
+    {
+      "title": "Breakit",
+      "url": "https://www.breakit.se/feed/artiklar",
+      "groups": [
+        "new",
+        "tech",
+        "fintech"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "Home - CBSNews.com",
+      "url": "https://www.cbsnews.com/latest/rss/main",
+      "groups": [
+        "news"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "Al Jazeera – Breaking News, World News and Video from Al Jazeera",
+      "url": "https://www.aljazeera.com/xml/rss/all.xml",
+      "groups": [
+        "news"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "Joel on Software",
+      "url": "https://www.joelonsoftware.com/feed/",
+      "groups": [
+        "blog"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "Agile Alliance",
+      "url": "https://agilealliance.org/feed/",
+      "groups": [
+        "tech scene"
+      ],
+      "tier": 5
+    },
+    {
+      "title": "InfoQ - News",
+      "url": "https://feed.infoq.com/news/",
+      "groups": [
+        "tech",
+        "news"
+      ],
+      "tier": 4
+    },
+    {
+      "title": "BBC News - Top stories",
+      "url": "http://feeds.bbci.co.uk/news/rss.xml",
+      "groups": [
+        "news"
+      ],
+      "tier": 2
+    },
+    {
+      "title": "BBC News - World",
+      "url": "http://feeds.bbci.co.uk/news/world/rss.xml",
+      "groups": [
+        "news"
+      ],
+      "tier": 2
+    },
+    {
+      "title": "BBC News - Business",
+      "url": "http://feeds.bbci.co.uk/news/business/rss.xml",
+      "groups": [
+        "news",
+        "business"
+      ],
+      "tier": 3
+    },
+    {
+      "title": "Riksbanken",
+      "url": "http://localhost:8080/riksbank.xml",
+      "groups": [
+        "news",
+        "banking"
+      ],
+      "tier": 1
+    },
+    {
+      "title": "Spiris",
+      "url": "http://localhost:8080/spiris.xml",
+      "groups": [
+        "news",
+        "pressrelease",
+        "ERP"
+      ],
+      "tier": 1
     }
   ]
 }
-

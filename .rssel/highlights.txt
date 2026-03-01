@@ -1,0 +1,10 @@
+# Highlight words/phrases (one per line)
+# Matching is case-insensitive and uses word boundaries where possible.
+# Examples:
+Växjö
+nvim
+Alvesta
+Småland
+Fortnox
+Visma
+EQT

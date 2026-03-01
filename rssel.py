@@ -117,6 +117,19 @@ def _parse_groups_arg(group_val: str | None) -> list[str]:
     return [g.strip() for g in re.split(r"[,\s]+", group_val) if g.strip()]
 
 
+def _parse_tiers_arg(tier_val: str | None) -> list[str]:
+    if not tier_val:
+        return []
+    tiers: list[str] = []
+    for tok in re.split(r"[,\s]+", tier_val):
+        t = tok.strip()
+        if not t:
+            continue
+        if t.isdigit() and t in {"1","2","3","4","5"}:
+            tiers.append(t)
+    return tiers
+
+
 def _parse_date_arg(s: str | None) -> int | None:
     """Parse a date/time argument into a local epoch seconds.
     Supports:
@@ -184,6 +197,8 @@ def full_config_template() -> str:
         "external_export_format = \"md\"\n\n"
         "# list --new window (hours)\n"
         "new_hours = \"24\"\n\n"
+        "# stats summary window (hours)\n"
+        "stats_recent_hours = \"48\"\n\n"
         "# list default max items (used when --limit not set)\n"
         "list_max = \"2000\"\n\n"
         "# (Deprecated) Tiered fetch intervals have been removed\n\n"
@@ -1824,10 +1839,15 @@ def cmd_stats(args):
     conn = db_conn()
     init_db(conn)
     cur = conn.cursor()
-    color = (getattr(args, "color", False) or cfg_flag(read_config(), "display_color", False)) and not getattr(args, "nocolor", False)
+    cfg = read_config()
+    color = (getattr(args, "color", False) or cfg_flag(cfg, "display_color", False)) and not getattr(args, "nocolor", False)
 
     def c(text, *codes):
         return _maybe(text, color, *codes)
+    def fmt_ts(ts: int | None) -> str:
+        if ts and ts > 0:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        return "----"
 
     # Feed stats (global, not filtered by items)
     cur.execute("SELECT COUNT(*) FROM feeds")
@@ -1889,15 +1909,32 @@ def cmd_stats(args):
 
     # New window (from config new_hours)
     try:
-        nh = int(read_config().get("new_hours", "24"))
+        nh = int(cfg.get("new_hours", "24"))
     except Exception:
         nh = 24
-    cutoff = int(datetime.now().timestamp()) - nh*3600
+    now_ts = int(datetime.now().timestamp())
+    cutoff = now_ts - nh*3600
     cur.execute(
         (f"SELECT COUNT(*) FROM items {where_sql} AND created_ts >= ?" if where_sql else "SELECT COUNT(*) FROM items WHERE created_ts >= ?"),
         (params + [cutoff]) if params else [cutoff]
     )
     items_new_win = (cur.fetchone() or (0,))[0]
+    summary_new_count = None
+    summary_hours = None
+    if getattr(args, "summary", False):
+        try:
+            summary_hours = int(cfg.get("stats_recent_hours", cfg.get("new_hours", "48")))
+        except Exception:
+            summary_hours = 48
+        recent_cutoff = now_ts - summary_hours * 3600
+        sum_sql = (
+            f"SELECT COUNT(*) FROM items {where_sql} AND deleted = 0 AND created_ts >= ?"
+            if where_sql
+            else "SELECT COUNT(*) FROM items WHERE deleted = 0 AND created_ts >= ?"
+        )
+        sum_params = (params + [recent_cutoff]) if params else [recent_cutoff]
+        cur.execute(sum_sql, sum_params)
+        summary_new_count = (cur.fetchone() or (0,))[0]
 
     # Per-group counts (alive)
     sql_groups = f"""
@@ -1926,16 +1963,20 @@ def cmd_stats(args):
     tag_rows = cur.fetchall()
 
     # Top sources (alive)
+    ts_column = "published_ts" if getattr(args, "date_field", "published") == "published" else "created_ts"
     sql_srcs = f"""
-        SELECT COALESCE(f.title, f.url) as name, f.url, COUNT(*) as cnt, MAX(items.{ 'published_ts' if args.date_field == 'published' else 'created_ts' }) as last
+        SELECT f.rowid, COALESCE(f.title, f.url) as name, f.url, COUNT(*) as cnt,
+               MAX(items.{ts_column}) as last_ts,
+               COALESCE(f.last_fetch_ts, 0) as last_fetch_ts
         FROM items JOIN feeds f ON items.feed_url = f.url
         {where_sql} {('AND' if where_sql else 'WHERE')} items.deleted = 0
-        GROUP BY f.url, name
+        GROUP BY f.rowid, f.url, name, f.last_fetch_ts
         ORDER BY cnt DESC, name
         LIMIT {top}
     """
     cur.execute(sql_srcs, params)
     src_rows = cur.fetchall()
+    summary_sources = src_rows
 
     if getattr(args, "json", False):
         out = {
@@ -1945,11 +1986,48 @@ def cmd_stats(args):
             "new_window": {"hours": nh, "count": items_new_win},
             "groups": [{"group": (g or "ungrouped"), "count": int(cnt)} for (g, cnt) in groups_rows],
             "top_tags": [{"name": n, "count": int(cnt)} for (n, cnt) in tag_rows],
-            "top_sources": [{"name": name, "url": url, "count": int(cnt), "last_ts": int(lts) if lts else None} for (name, url, cnt, lts) in src_rows],
+            "top_sources": [
+                {
+                    "id": int(fid),
+                    "name": name,
+                    "url": url,
+                    "count": int(cnt),
+                    "last_ts": int(lts) if lts else None,
+                    "last_fetch_ts": int(fetch_ts) if fetch_ts else None,
+                }
+                for (fid, name, url, cnt, lts, fetch_ts) in src_rows
+            ],
         }
+        if getattr(args, "summary", False):
+            out["summary"] = {
+                "recent_hours": summary_hours,
+                "recent_count": summary_new_count,
+                "unread": items_unread,
+                "sources": [
+                    {
+                        "id": int(fid),
+                        "name": name,
+                        "url": url,
+                        "last_ts": int(lts) if lts else None,
+                        "last_fetch_ts": int(fetch_ts) if fetch_ts else None,
+                    }
+                    for (fid, name, url, cnt, lts, fetch_ts) in summary_sources
+                ],
+            }
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     # Print
+    if getattr(args, "summary", False):
+        print(c("Summary:", 1))
+        if summary_new_count is not None and summary_hours is not None:
+            print(f"  New items (last {summary_hours}h): {summary_new_count}")
+        print(f"  Unread items: {items_unread}")
+        if summary_sources:
+            print("  Sources:")
+            for (fid, name, url, cnt, lts, fetch_ts) in summary_sources:
+                print(
+                    f"    [{fid}] {c(name,1)}  last item={c(fmt_ts(lts),2)}  last fetch={c(fmt_ts(fetch_ts),2)}"
+                )
     print(c("Feeds:", 1), f"total={feeds_total}", c("active=", 32) + str(feeds_active), c("archived=", 31) + str(feeds_arch))
     print(c("Items:", 1), f"all={items_all}", c("alive=", 32) + str(items_alive), c("unread=", 33) + str(items_unread), c("starred=", 33) + str(items_star), c("deleted=", 31) + str(items_del))
     print(c("Last: ", 2) + last, c(" new_window=", 2) + f"{items_new_win} (last {nh}h)")
@@ -1965,9 +2043,10 @@ def cmd_stats(args):
     # Top sources
     if src_rows:
         print(c("Top sources:", 1))
-        for (name, url, cnt, lts) in src_rows:
-            lstr = datetime.fromtimestamp(lts).strftime("%Y-%m-%d %H:%M") if lts else "----"
-            print(f"  {c(name,1)} - {c(url,36)}  {cnt}  {c(lstr,2)}")
+        for (fid, name, url, cnt, lts, fetch_ts) in src_rows:
+            lstr = fmt_ts(lts)
+            fstr = fmt_ts(fetch_ts)
+            print(f"  [{fid}] {c(name,1)} - {c(url,36)}  {cnt}  last item {c(lstr,2)}  last fetch {c(fstr,2)}")
     return 0
 
 
@@ -3141,6 +3220,22 @@ def cmd_sync(args):
     else:
         upsert_feeds(conn, entries, args.group)
     cur = conn.cursor()
+    feed_meta: dict[str, tuple[int | None, str, str]] = {}
+    try:
+        cur.execute("SELECT rowid, url, COALESCE(title, url) as name, COALESCE(tier,'3') FROM feeds")
+        for rid, furl, name, tier in cur.fetchall():
+            feed_meta[furl] = (rid, name, str(tier) if tier is not None else '3')
+    except Exception:
+        pass
+    show_src_url = bool(getattr(args, "source_url", False))
+    def _feed_label(url: str) -> str:
+        rid, name, tier = feed_meta.get(url, (None, url, '3'))
+        base = name
+        if rid:
+            base = f"[{rid}] {name}"
+        if show_src_url:
+            return f"{base} ({url})"
+        return base
     # Determine which feeds to fetch
     feed_urls: list[str] = []
     if getattr(args, "id", None) is not None or getattr(args, "ids", None) or getattr(args, "source", None):
@@ -3190,10 +3285,13 @@ def cmd_sync(args):
     else:
         cur.execute("SELECT url FROM feeds WHERE archived = 0")
         feed_urls = [r[0] for r in cur.fetchall()]
+    tier_filter = _parse_tiers_arg(getattr(args, "tier", None))
+    if tier_filter:
+        feed_urls = [u for u in feed_urls if (feed_meta.get(u, (None, u, '3'))[2]) in tier_filter]
     if getattr(args, "debug", False):
         print(c(f"[sync] selected {len(feed_urls)} feed(s)", 2))
         for u in feed_urls:
-            print("  - " + c(u, 36))
+            print("  - " + c(_feed_label(u), 36))
     total_new = 0
     for url in feed_urls:
         raw = _fetch_with_debug(url, timeout=(int(getattr(args, "timeout", 15) or 15)), debug=getattr(args, "debug", False))
@@ -3251,7 +3349,8 @@ def cmd_sync(args):
         else:
             new_count = 0
         total_new += new_count
-        print(c("Fetched ", 2) + c(url, 36) + c(": ", 2) + c(f"{len(items)}", 2) + c(" items, new ", 2) + c(str(new_count), 32 if new_count > 0 else 33, 1))
+        label = _feed_label(url)
+        print(c("Fetched ", 2) + c(label, 36) + c(": ", 2) + c(f"{len(items)}", 2) + c(" items, new ", 2) + c(str(new_count), 32 if new_count > 0 else 33, 1))
     print(c("Fetch complete. New items: ", 2) + c(str(total_new), 32 if total_new > 0 else 33, 1))
 
     # Auto-tagging (default configurable; --no-auto-tags disables)
@@ -4842,6 +4941,7 @@ def build_parser():
     sp_all.add_argument("--unread-only", action="store_true", help="Only export unread items")
     sp_all.add_argument("--limit", "-n", type=int, help="Limit number of items per group")
     sp_all.add_argument("--clean", action="store_true", help="Clean dest directory before export")
+    sp_all.add_argument("--source-url", action="store_true", help="Show source URLs in sync output")
     # Auto-tagging (enabled by default)
     sp_all.add_argument("--no-auto-tags", dest="auto_tags", action="store_false", help="Disable auto-tagging before export")
     sp_all.add_argument("--max-tags", type=int, default=5, help="Max tags per item when auto-tagging (default: 5)")
@@ -5267,6 +5367,7 @@ def build_parser():
     sp_stats.add_argument("--color", action="store_true", help="Colorize output")
     sp_stats.add_argument("--nocolor", action="store_true", help="Disable ANSI colors in output")
     sp_stats.add_argument("--json", action="store_true", help="Output stats as JSON")
+    sp_stats.add_argument("--summary", action="store_true", help="Show a concise summary (new window, unread count, source ids + last updates)")
     sp_stats.set_defaults(func=cmd_stats)
 
     return p
